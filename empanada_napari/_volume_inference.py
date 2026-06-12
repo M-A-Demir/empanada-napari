@@ -1,7 +1,12 @@
 import os
-from pathlib import Path
 import time
+import zarr
+import torch
+import joblib
 import napari
+import numpy as np
+import dask.array as da
+
 from napari import Viewer
 from napari.layers import Image
 from napari.qt.threading import thread_worker
@@ -9,19 +14,16 @@ from napari_plugin_engine import napari_hook_implementation
 from magicgui import widgets, magic_factory
 from qtpy.QtWidgets import QScrollArea
 
-import numpy as np
-import zarr
-import dask.array as da
-import torch
+from pathlib import Path
+from itertools import product
 from torch.cuda import device_count
-# from torch.backends.quantized import engine, supported_engines
-from empanada_napari.inference import Engine3d, tracker_consensus, stack_postprocessing
+from dask.array.core import slices_from_chunks
+from empanada_napari.inference import Engine3d, _tracker_consensus, tracker_consensus, _stack_postprocessing, stack_postprocessing
 from empanada_napari.multigpu import MultiGPUEngine3d
 from empanada_napari.utils import get_configs, abspath
 from empanada.config_loaders import read_yaml
+from empanada.zarr_utils import _write_empty_chunk, all_chunk_indices
 
-from empanada.zarr_utils import _write_empty_chunk, chunk_slices
-from itertools import product
 
 
 quantized_supported = True
@@ -133,44 +135,106 @@ class VolumeInference:
 
         image = self._get_image_as_array()
 
+        # image will be a da.Array (lazy loaded)
+        # 1. Create the delayed version of the function: delayed_infer = joblib.delayed(infer)
+        # 2. Create a list of jobs from the chunks: jobs = [delayed_infer(chunk[i]) for i in chunks]
+        # 3. Run the jobs using: executor(jobs)
 
+
+        # When we have a dask/zarr file, we will iterate over each chunk
+        # Load the chunk into memory
+        # Call either the orthoplane or volume segmentation methods on it (Future issues with consensus on ortho can be dealt with later)
+        # Write out the mask/result[0][0] to the output chunk
+        # 
+        # Later: Figure out how to use the built-in writing to the chunk 
         if type(image) == da.core.Array:
             # If loaded dask array, write the empty output zarr array to disk
-            # zout = _write_empty_chunk(image)
+            zout = _write_empty_chunk(image)
 
             # mapped_data = da.map_blocks(my_function, data) equiv to below
             # stack = image.map_blocks(self._determine_inference)
 
             # Write stack to chunk it came from
-            # slices_per_dim = chunk_slices(image.chunks)
 
+            # First lets create the jobs
+            # We need a list of all the chunk indices:
+            chunk_indices = list(slices_from_chunks(image.chunks)) # may not need to be a list
+            #Q: does this produce the same thing as np.ndindex(image.numblocks)?
+
+            # Second, for each index, lets pass (image[index], index) to our delayed_inference wrapper function
+            # This will create each function call (i.e. inference(image[0:10], index=10)), but won't run them yet
+            delayed_run_segmentation = joblib.delayed(self.run_segmentation)
+            jobs = [delayed_run_segmentation(image[idx], zout, idx) for idx in chunk_indices]
             
-            for idx in np.ndindex(image.numblocks):
-                chunk = image.blocks[idx].compute()
+            if len(jobs)>1:
+                jobs = jobs[:1]
+    
+            for job in jobs:
+                print("Job:", job)
+    
+            executor = joblib.Parallel(n_jobs=1, backend='threading')
+            executor(jobs)
+
+            print("Done.")
+            return da.from_zarr(zout)
+
+            # Within the wrapper, its behaviour should be:
+                # Take the array chunk
+                # Figure out whatever inference it's meant to call
+                # Call it on that array chunk
+                # Set zout[index] = result
                 
-                if chunk.dtype != np.uint8:
-                    chunk = chunk.astype(np.uint8)
-                print("WORKING ON CHUNK:", idx, chunk.shape, chunk.dtype)
 
-                result = self._stack_inference(self.engine, chunk, self.inference_plane)
-                print(result)
+            # for idx in np.ndindex(image.numblocks):
+                
 
-                print("Done.")
-                return
 
+            #     chunk = image.blocks[idx].compute()
+                
+            #     if chunk.dtype != np.uint8:
+            #         chunk = chunk.astype(np.uint8)
+            #     print("WORKING ON CHUNK:", idx, chunk.shape, chunk.dtype)
+
+            #     result = self._stack_inference(self.engine, chunk, self.inference_plane)
+            #     result = self.start_postprocess_worker(result)
+
+            #     slices = tuple(
+            #                 slice(sum(image.chunks[dim][:i]), sum(image.chunks[dim][:i+1]))
+            #                 for dim, i in enumerate(idx)
+            #             )
+                
+            #     print("DEBUG", idx, slices, len(result), result[0][0])
+            #     print("DEBUG2", zout[slices].shape, result[0][0].shape)
+                
+            #     zout[slices] = result[0][0]
+
+            #     print("Done.")
+            #     return
+
+   
+
+    def run_segmentation(self, input_array, zarr_store, slice_idx):
+        if type(input_array) == da.core.Array:
+            input_array = input_array.compute()
+        print("Running on Slice: ", slice_idx)
 
         # Run inference and get result
         if self.orthoplane:
-            result = self._orthoplane_inference(self.engine, image)
+            print("Running Orthoplane Inference:")
+            result = self._orthoplane_inference(self.engine, input_array)
+            result = self.start_consensus_worker(result)
         
         else:
             print("Running Stack Inference:")
-            result = self._stack_inference(self.engine, image, self.inference_plane)
+            result = self._stack_inference(self.engine, input_array, self.inference_plane)
+            result = self.start_postprocess_worker(result)
+
+        print(len(result), result[0])
+        # write out result to out zarr
+        # print("DEBUGGING:", result.shape, result.chunks, slice_idx)
+        zarr_store[slice_idx] = result[0][0]
         
-        print(result)
-    
-        return result
-    
+        return
 
     # ---------------- Engine management ----------------
     def get_engine(self):
@@ -305,7 +369,28 @@ class VolumeInference:
             axes_dict[axis_name] = stack
         return trackers_dict, axes_dict
 
+    def start_postprocess_worker(self, *args):
+        trackers_dict = args[0][2]
+        stack_result = list(_stack_postprocessing(
+            trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
+            min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype, chunk_size=self.chunk_size
+        ))
 
+        return stack_result
+        
+    def start_consensus_worker(self, *args):
+        trackers_dict, axes_dict = args[0][0], args[0][1]
+
+        # get consensus stack from the trackers_dict
+        consensus_result = list(_tracker_consensus(
+            trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
+            pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view,
+            min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype,
+            chunk_size=self.chunk_size
+        ))
+
+        return consensus_result
+    
 
 class VolumeInferenceWidget(VolumeInference):
     def __init__(self,
@@ -411,39 +496,76 @@ class VolumeInferenceWidget(VolumeInference):
         # Get the 3d slice from the image (Can mock a layer/viewer object in the tests)
         image = self._get_image_as_array()
 
-        if self.orthoplane:
-            worker = self.orthoplane_inference(self.engine, image)
-            worker.returned.connect(lambda result: self.start_consensus_worker(*result))
-            worker.start()
+        # if self.orthoplane:
+        #     worker = self.orthoplane_inference(self.engine, image)
+        #     worker.returned.connect(self.start_consensus_worker)
+        #     worker.start()
 
-        else:
-            # result = self._stack_inference(self.engine, image, self.inference_plane)
-            # print(result)
-            worker = self.stack_inference(self.engine, image, self.inference_plane)
-            worker.returned.connect(self._new_segmentation)
-            worker.returned.connect(self.start_postprocess_worker)
-            worker.start()
+        # else:
+        #     worker = self.stack_inference(self.engine, image, self.inference_plane)
+        #     worker.returned.connect(self._new_segmentation)
+        #     worker.returned.connect(self.start_postprocess_worker)
+        #     worker.start()
         
 
 
         if type(image) == da.core.Array:
+            # If loaded dask array, write the empty output zarr array to disk
+            store_path = '/home/efv97572/empanada_tem/out2.ome.zarr'
+            zout = _write_empty_chunk(store_path, image)
+            chunk_indices = list(slices_from_chunks(image.chunks)) # may not need to be a list
+            # chunk_indices = all_chunk_indices(image)
+            
+            delayed_run_segmentation = joblib.delayed(self.run_segmentation)
+            jobs = [delayed_run_segmentation(image, zout, idx) for idx in chunk_indices][:10]
 
+            for job in jobs:
+                print("Job:", job)
+    
+            executor = joblib.Parallel(n_jobs=-1, backend='threading')
+            executor(jobs)
+
+            print("Done.")
+            return
+    
+            # If loaded dask array, write the empty output zarr array to disk
+            zout = _write_empty_chunk(image, self.image_layer.scale, self.image_layer.units)
+
+            # mapped_data = da.map_blocks(my_function, data) equiv to below
+            # stack = image.map_blocks(self._determine_inference)
+
+            # Write stack to chunk it came from
+            # slices_per_dim = chunk_slices(image.chunks)
+
+            
             for idx in np.ndindex(image.numblocks):
                 chunk = image.blocks[idx].compute()
                 
                 if chunk.dtype != np.uint8:
                     chunk = chunk.astype(np.uint8)
                 print("WORKING ON CHUNK:", idx, chunk.shape, chunk.dtype)
-                
-                # import tifffile as tiff
-                # tiff.imwrite(
-                #     '/home/efv97572/empanada_tem/temp_image_3d.tif', chunk)
 
                 result = self._stack_inference(self.engine, chunk, self.inference_plane)
-                print(result)
+                result = self.start_postprocess_worker(result)
+                seg = result[0][0]
+                print("Dtype:", type(result), type(result[0][2]), type(seg))
 
-                print("Done.")
-                return      
+                slices = tuple(
+                            slice(sum(image.chunks[dim][:i]), sum(image.chunks[dim][:i+1]))
+                            for dim, i in enumerate(idx)
+                        )
+                
+                print(f"Result chunk shape: {seg.shape}")
+                seg[2,2,2] = 156
+                zout[slices] = seg
+                
+                print("image.chunks:", image.chunks)
+                print("image.numblocks:", image.numblocks)
+                print("image.shape:", image.shape)
+                print("zout.shape:", zout.shape)
+                print("zout.chunks:", zout.chunks)
+            print("Done.")
+                # return
 
         return
 
@@ -487,9 +609,6 @@ class VolumeInferenceWidget(VolumeInference):
         self.pbar.hide()
 
     def _new_segmentation(self, *args):
-        print("RETURNED FROM INFERENCE: ", args, "\n", args[0], "\n mask:", args[0][0])
-        # Mask is None - this doesn't do anything??
-
         mask = args[0][0]
         axis_name = args[0][1]
         ###tmp
@@ -508,9 +627,6 @@ class VolumeInferenceWidget(VolumeInference):
 
     def _new_class_stack(self, *args):
         masks, class_name, instances = args[0]
-
-        print("Args here??", masks, instances)
-
         try:
             self._new_layers(masks, f'{class_name}-prediction', instances)
             for layer in self.viewer.layers:
@@ -520,29 +636,31 @@ class VolumeInferenceWidget(VolumeInference):
         except Exception as e:
             print(e)
 
-    def start_postprocess_worker(self, *args):
-        trackers_dict = args[0][2]
-        postprocess_worker = stack_postprocessing(
-            trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
-            min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype, chunk_size=self.chunk_size
-        )
-        postprocess_worker.yielded.connect(self._new_class_stack)
-        postprocess_worker.start()
+    # def start_postprocess_worker(self, *args):
+    #     trackers_dict = args[0][2]
+    #     postprocess_worker = stack_postprocessing(
+    #         trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
+    #         min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype, chunk_size=self.chunk_size
+    #     )
+    #     postprocess_worker.yielded.connect(self._new_class_stack)
+    #     postprocess_worker.start()
 
-    def start_consensus_worker(self, trackers_dict, axes_dict):
-        # Add all the xy, xz, yz layers to napari:
-        for axis_name, mask in axes_dict.items():
-            self._new_segmentation((mask, axis_name))
+    # def start_consensus_worker(self, trackers_dict, axes_dict):
+    #     # Add all the xy, xz, yz layers to napari:
+    #     for axis_name, mask in axes_dict.items():
+    #         self._new_segmentation((mask, axis_name))
 
-        # get consensus stack from the trackers_dict
-        consensus_worker = tracker_consensus(
-            trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
-            pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view,
-            min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype,
-            chunk_size=self.chunk_size
-        )
-        consensus_worker.yielded.connect(self._new_class_stack) # supposed to add consensus as layer
-        consensus_worker.start()
+    #     # get consensus stack from the trackers_dict
+    #     consensus_worker = tracker_consensus(
+    #         trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
+    #         pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view,
+    #         min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype,
+    #         chunk_size=self.chunk_size
+    #     )
+    #     consensus_worker.yielded.connect(self._new_class_stack) # supposed to add consensus as layer
+    #     consensus_worker.start()
+
+
     # ---------------- Inference runners ----------------
     @thread_worker
     def stack_inference(self, engine, volume, axis_name):

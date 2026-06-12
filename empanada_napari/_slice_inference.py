@@ -1,5 +1,10 @@
+import sys
+
+import joblib
 import numpy as np
 import dask.array as da
+import ome_zarr_models
+import zarr
 from time import time
 from tqdm import tqdm
 from skimage.draw import polygon
@@ -14,14 +19,18 @@ import dask.array as da
 from time import time
 from tqdm import tqdm
 from skimage.draw import polygon
+from ome_zarr_models import open_ome_zarr
 
 from empanada.config_loaders import read_yaml
 from empanada_napari.inference import Engine2d
 from empanada_napari.utils import get_configs, abspath
+from empanada.zarr_utils import _write_empty_chunk, _generate_tiles
 
 from napari import Viewer
 from napari.layers import Image, Labels, Shapes
 from napari_plugin_engine import napari_hook_implementation
+
+from dask.array.core import slices_from_chunks
 
 from magicgui import magicgui, widgets
 from skimage import measure
@@ -35,7 +44,8 @@ quantized_supported = True
 if engine in (None or 'none'):
     quantized_supported = False
     
-class SliceInferenceWidget:
+
+class SliceInference:
     def __init__(self, 
             image_layer: Image,
             model_config: str,
@@ -93,80 +103,172 @@ class SliceInferenceWidget:
         if self.last_config is None:
             self.last_config = self.model_config_name
 
+        if isinstance(self.image_layer, da.Array) and self.downsampling==1:
+            self.downsampling = 1 #6
+            print(f"Running initial pass on downsampled image. Downsampling: {self.downsampling}")
+
         self.get_engine()
                 
         # Get the 2d slice from the image (Can mock a layer/viewer object in the tests)
-        if not self.batch_mode:
-            if self.confine_to_roi:
-                shapes_layer = [layer for layer in self.viewer.layers if isinstance(layer, Shapes)][0]
-                image2d, y, x, y_max, x_max, binary_mask = self._get_roi_slice(self.image_layer, shapes_layer)
-                image2d[binary_mask == False] = 0
-                axis, plane = "overloaded", self.image_layer.data.shape
-            else:
-                image2d, axis, plane, y, x = self._get_current_slice(self.image_layer)
-            print(f'Image of size {image2d.shape} sliced at plane {plane} from axis {axis}')
-            if type(image2d) == da.core.Array:
-                image2d = image2d.compute()
+        image, axis, plane, y, x = self._get_image_as_array(self.image_layer)
+        print(image.shape, self.image_layer.shape)
+
+        import tifffile as tiff
+        timg = tiff.imread('/home/efv97572/empanada_tem/10311-IM1-chunk2.tiff')
+        print(np.array_equal(image, timg[223]), timg.shape)
+      
+
+        # Need a condition that the array should meet to run inference over tiles... maybe arr size?
+        if type(image) == da.core.Array:
+            out_store = self._zarr_seg_workflow(image, axis, plane, y, x)
+
+            return out_store
+        
+            # First pass: Get the slice, Downsample the array to 16, 
+            # Rechunk the array into the biggest size possible
+            # We will initially try with 2x2 (4 panels total)
+            # Configure the engine
+            # Write out the seg to labels/segmentation/16/ 
+
+
+        else: # temporarily skip non-zarr files
+            return
+
+    def _zarr_seg_workflow(self, image, axis, plane, y, x):
+        store_path = '/home/efv97572/empanada_tem/2dout2.ome.zarr'
+        # Create OME-Zarr store with empty array with same shape as image, and an array == downsampled-by-2 
+        zout, zout_down = _write_empty_chunk(store_path, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
+        
+        # First, downsample the 'image' array and rechunk it into 4 panels
+        image_down = image[::2, ::2]# da.coarsen(np.mean, image, { -2: 2, -1: 2 })
+            # Later, we will get this array directly from the zarr store
+        tile_shape = [dim//2 for dim in image_down.shape]
+        chunk_indices = list(_generate_tiles(image_down.shape, tile_shape))
+        print("CHUNK INDICES:", image_down.shape, chunk_indices)
+
+        # Second, run inference on the panels in parallel
+        delayed_run_segmentation = joblib.delayed(self.run_segmentation)
+        jobs = [delayed_run_segmentation(image_down[idx], axis, plane, y, x, zout_down, idx) for idx in chunk_indices]
+        for job in jobs: print("Job:", job)
+        executor = joblib.Parallel(n_jobs=-1, backend='threading')
+        executor(jobs) 
+        
+        # Third, Get the strips along the panel "seams" & run segmentation
+        pad = 100
+        y_chunk = image_down.shape[0]//2
+        x_chunk = image_down.shape[1]//2
+
+        v_idx = (slice(0, image_down.shape[0], None), slice(x_chunk-pad, x_chunk+pad, None))
+        h_idx = (slice(y_chunk-pad, y_chunk+pad, None), slice(0, image_down.shape[1], None))
+        vertical_strip = image_down[v_idx]
+        horizontal_strip = image_down[h_idx]
+        
+        self.run_segmentation(vertical_strip, axis, plane, y, x, zout_down, v_idx)
+        self.run_segmentation(horizontal_strip, axis, plane, y, x, zout_down, h_idx)
+
+        # Fourth, Merge the overlapping labels
+
+
+        # Fifth, use this array and upscale it to get the highest res array, DO NOT RE-SEGMENT
+        # Load the coordinate transforms from the original dataset:
+        path = "test_path.ome.zarr"
+        coord_transforms = self._load_ome_zarr(path)
+
+        # We have the scales per transform, just get this as a list:
+        # 
+
+        for transform in coord_transforms:
+            # create the zarr store per transform:
+            scale = transform['coordinateTransformations'][0]['scale'] #= [1.0, 1.0, 0.008, 0.005, 0.005]
+            zout_prop = _write_empty_chunk(store_path, image, inp_scale=scale, overwrite=False) # inp_scale needs to come from input image zarr store
+    
+            # First get the array:
+            downsampled_seg = zout_down * scale # This probably isn't correct
+
+        # Sixth, get the other samplings across the other resolutions in the original too
+        # Done  
+                
+
+        # chunk_indices = list(slices_from_chunks(image.chunks))
+        # print("CHUNK IDICES:", image_down.shape, chunk_indices)
 
         
-        #### The part above should return a 2D slice from the Zarr input fine
-
-            #### Now, we need to __split the 2D slice into tiles__ because the slice is still very big!
-            #### This part should only run if we have an image that is a zarr or dask arr
-                # Need a condition that the array should meet to run inference over tiles... maybe arr size?
-            
-                #### Setup jobs:
-                # if batch_mode false
-
-                #create image2dout array
-                # image2dout = np.zeros_like(image2d)
-
-                # compute segmentation on each of the tiles
-                # run in parallel
-                # Pass the result to _show_test_result() or _store_test_result()
-
-                # if batch_mode true
-                # compute segmentation using the run_model_batch
-                # run in parallel
-                # Pass result to _show/store_test_result()
-
-
-
-
+        # if len(jobs)>1:
+        #     jobs = jobs[:1]
+    
         
 
-        # Run the inference methods (either threaded or synchronously)
-        match (self.batch_mode, use_thread):
-            case True, True:
-                assert not self.output_to_layer, "Batch mode is not compatible with output to layer!"
-                assert not self.image_layer.multiscale, "Batch mode is not compatible with multiscale images!"
-                assert not self.viewport, "Batch mode is not compatible with viewport inference!"
-                assert not self.confine_to_roi, "Batch mode is not compatible with ROI inference!"
+        print("Done.")
+        return da.from_zarr(zout_down)
 
-                test_worker = self.run_model_batch(self.engine, self.image_layer.data, self.fill_holes)
-                if self.image_layer.data.ndim == 2:
-                    test_worker.returned.connect(self._show_test_result)
-                else:
-                    test_worker.returned.connect(self._show_batch_stack)
-                test_worker.start()
 
-            case True, False:# For testing batch slice inference
-                seg, axis, plane, y, x = self._run_model_batch(self.engine, self.image_layer.data, self.fill_holes)
-                return seg, axis, plane, y, x
+    def run_segmentation(self, input_array, axis, plane, y, x, zarr_store=None, slice_idx=None):
+        if isinstance(input_array, da.Array):
+            input_array = input_array.compute()
+
+        if self.batch_mode:
+            assert not self.output_to_layer, "Batch mode is not compatible with output to layer!"
+            assert not self.image_layer.multiscale, "Batch mode is not compatible with multiscale images!"
+            assert not self.viewport, "Batch mode is not compatible with viewport inference!"
+            assert not self.confine_to_roi, "Batch mode is not compatible with ROI inference!"
             
-            case False, True:
-                inference_worker = self.run_model(self.engine, image2d, axis, plane, y, x, self.fill_holes)
-                if self.output_to_layer:
-                    inference_worker.returned.connect(self._store_test_result)
-                else:
-                    inference_worker.returned.connect(self._show_test_result)
-                inference_worker.start()
+            print("Running Batch Mode Inference:")
+            seg, axis, plane, y, x = self._run_model_batch(self.engine, input_array, self.fill_holes)
 
-            case False, False: # For testing non-batch slice inference
-                seg, axis, plane, y, x = self._run_model(self.engine, image2d, axis, plane, y, x, self.fill_holes)
-                return seg, axis, plane, y, x
-            
+            # Future: batch_mode_runner method will be this^ in sliceinference, and napari threaded ver in sliceinferencewidget (DRY)
+            # Same for regular runner below
+        else:
+            seg, axis, plane, y, x = self._run_model(self.engine, input_array, axis, plane, y, x, self.fill_holes)
+
+        # if isinstance(input_array, da.Array):
+            #zarr_store[slice_idx] = seg
+            #return
+        # return seg, axis, plane, y, x
+
+        print("!!!Z", input_array.shape, seg.shape, slice_idx)
+
+        existing = zarr_store[slice_idx]
+        mask = (seg > 0) & (existing == 0) # True (Replace label) if seg value is greater than 0, and existing value is 0
+        existing[mask] = seg[mask]
+        zarr_store[slice_idx] = existing 
+
+        # Merge overlapping labels into same label?
+
+        pairs = np.column_stack([
+            existing[mask],
+            seg[mask]
+        ])
+
+        offset = existing.max() + 100
+        rows = pairs[:, 0]
+        cols = pairs[:, 1] + offset
+
+        graph = sparse.coo_matrix(
+            (np.ones(len(rows)), (rows, cols))
+        )
+
+        n_components, labels = connected_components(graph, directed=False)
+
+
         return
+
+
+    def _load_ome_zarr(self, path: str) -> None:
+        """
+        Load the OME-Zarr file's metadata.
+
+        Parameters
+        ----------
+        path : str
+            Path to OME-Zarr group.
+        """
+
+        group = zarr.open_group(path, mode="r")
+        multiscales = group.attrs["multiscales"]
+        datasets = multiscales[0]["datasets"]
+
+        return datasets
+        
 
     # ---------------- Engine management ----------------
     def get_engine(self):
@@ -206,6 +308,49 @@ class SliceInferenceWidget:
         return
 
     # ---------------- Helper methods ----------------    
+    def _get_image_as_array(self, img_layer):
+        '''If input image is a 2D array, return
+        '''
+    
+    # Batch mode will iterate across a 3D array (i.e. image_layer.data), so return array
+    # Non-batch mode will run on 2D array, so return array if 2D, and slice if 3D
+        if self.batch_mode:
+            return img_layer, None, None, None, None
+
+        else:
+            # if self.confine_to_roi:
+                # Apply binary mask to the image
+                # Not currently implemented outside of viewer
+            
+            # else:
+            image = img_layer
+            y, x = 0, 0
+            slices = [slice(None)] * img_layer.ndim
+            axis = [0,1,2,3]
+
+            if img_layer.ndim == 4: # multiscale? use highest res level
+                image = img_layer[0]
+                # axis = viewer param, as is plane so i don't think these are relevant. we will just slice along z
+                axis = tuple(axis[:2])
+                plane = (0, 0)
+                slices[axis[0]], slices[axis[1]] = plane[0], plane[1]
+
+            elif img_layer.ndim == 3:
+                axis = axis[0]
+                # plane = 0
+                plane = 223 # TMP
+                slices[axis] = plane
+                print("TEST DEBUG??", axis, plane, slices)
+
+            else:
+                axis = None
+                plane = None
+
+            print(f'Image of size {img_layer.shape} sliced at plane {plane} from axis {axis}')
+
+            return image[tuple(slices)], axis, plane, y, x
+                
+
     def _fill_holes_in_segmentation(self, mask):
         unique_indices = np.unique(mask)
         rprops = measure.regionprops(mask)
@@ -345,8 +490,8 @@ class SliceInferenceWidget:
                        self.image_layer.scale), "Viewport inference only supports images with scale 1 in all dimensions!"
             assert self.viewer.dims.order[0] != 1, "Viewport inference not supported for xz planes!"
 
-        if not all(s == 1 for s in self.image_layer.scale):
-            print(f'Image has non-unit scale. 2D segmentations will disappear after rotation or axis rolling!')
+        # if not all(s == 1 for s in self.image_layer.scale):
+            # print(f'Image has non-unit scale. 2D segmentations will disappear after rotation or axis rolling!')
         return
 
     # ---------------- Inference runners ----------------
@@ -453,7 +598,7 @@ class SliceInferenceWidget:
         self.pbar.hide()
 
 
-    def _store_test_result(self, *args):
+    def  _store_test_result(self, *args):
         seg, axis, plane, y, x = args[0]
 
         if axis == "overloaded":
@@ -482,6 +627,17 @@ class SliceInferenceWidget:
         self.output_layer.visible = True
 
         self.pbar.hide()
+
+
+
+class SliceInferenceWidget(SliceInference):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+
+
+
 
 # ---------------- Napari GUI wrapper ----------------
 def slice_inference_widget():

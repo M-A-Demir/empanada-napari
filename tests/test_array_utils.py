@@ -126,7 +126,7 @@ def test__join_ranges(ranges, expected):
 
     The function should:
     - read in a list of ranges of (start, end)
-    - return an array containing a joined [start, end] range
+    - return an array containing joined [start, end] range(s)
 
     Expected:
     - A list of [start, end] ranges

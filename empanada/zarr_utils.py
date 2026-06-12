@@ -199,6 +199,7 @@ def all_chunk_indices(array: da.Array) -> Generator[tuple[slice, ...], None, Non
     Generate indices that represent all chunks in a Zarr (Dask) Array.
     """
     ndim = len(array.shape)
+    print("DEBUGGING", ndim, range(ndim), array.shape, array.chunks)
     indices = [range(0, array.shape[i], array.chunks[i]) for i in range(ndim)]
     chunk_corners = itertools.product(*indices)
     yield from (
@@ -217,7 +218,7 @@ def all_chunk_indices(array: da.Array) -> Generator[tuple[slice, ...], None, Non
 def apply_to_chunk(
     f: Callable[[npt.NDArray[Any]], npt.NDArray[Any]],
     input_array: da.Array,
-    output_array: zarr.Array,
+    output_array: np.ndarray,
     chunk_index: slice,
 ) -> None:
     
@@ -263,26 +264,124 @@ def apply_to_chunk(
 #     mapped_data = da.map_blocks(f, array)
 #     return
 
-def _write_empty_chunk(array):
-    dest_path = '/home/efv97572/empanada_tem/zarr.out'
-    z = zarr.open(
-        dest_path,
-        mode="w",
+import ome_zarr.writer
+import ome_zarr.io
+import ome_zarr_models
+
+def new_write_empty_chunk(store_path, array, level=1, inp_scale=None, inp_units=None):
+    ndims = array.ndim
+    dim_names = ["z", "y", "x"][-1*ndims:]
+    if inp_scale is None:
+        inp_scale = [1]*ndims
+    if inp_units is None:
+        inp_units = ["micrometer"]*ndims
+    else:
+        inp_units = [str(u) for u in inp_units]
+        inp_scale = list(inp_scale)
+
+    root = zarr.open_group(store_path, mode="w", zarr_format=3)
+
+    chunk_shape = tuple(c[0] for c in array.chunks)
+    
+    root.attrs["labels"] = ["segmentation"]
+    labels_root = root.require_group("labels/segmentation")
+
+    ome_zarr.writer.write_multiscales_metadata(
+        labels_root,
+        datasets=[
+            {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": inp_scale}]}, #inp_scale[-1*ndims:]}]},
+            {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": [n*2 for n in inp_scale]}]} #inp_scale[-1*ndims:]}]}
+            ],
+        axes=[
+            {"name": name, "type": "space", "unit": unit} for unit, name in zip(inp_units, dim_names)
+        ],
+        type="labels"
+    )
+    
+    z = labels_root.require_array(
+        "0",
         shape=array.shape,
-        chunks=array.chunks,
-        dtype="uint8",
-        zarr_format=3
+        chunks=chunk_shape,
+        dtype="int32",
+        dimension_names=dim_names
+    )
+
+    down_shape = tuple(s // 2 for s in array.shape)
+    down_chunks = tuple(max(1, c // 2) for c in down_shape)
+
+    z1 = labels_root.require_array(
+    "1",
+    shape=down_shape,
+    chunks=down_chunks,
+    dtype="int32",
+    dimension_names=dim_names,
+    )
+
+    print(f"Initial empty array written at: {store_path}")
+    return z, z1
+
+
+def _write_empty_chunk(store_path, array, level=1, inp_scale=None, inp_units=None, overwrite=True):
+    # TO-DO: If overwrite=False, don't recreate the root
+    
+    ndims = array.ndim
+    dim_names = ["z", "y", "x"][-1*ndims:]
+    if inp_scale is None:
+        inp_scale = [1]*ndims
+    if inp_units is None:
+        inp_units = ["pixel"]*ndims
+    else:
+        inp_units = [str(u) for u in inp_units]
+        inp_scale = list(inp_scale)
+
+    root = zarr.open_group(store_path, mode="w", zarr_format=3)
+
+    chunk_shape = tuple(c[0] for c in array.chunks)
+    
+    root.attrs["labels"] = ["segmentation"]
+    labels_root = root.require_group("labels/segmentation")
+
+    ome_zarr.writer.write_multiscales_metadata(
+        labels_root,
+        datasets=[
+            # {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": inp_scale[-1*ndims:]}]},
+            {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [n*2 for n in inp_scale]}]} #inp_scale[-1*ndims:]}]}
+            ],
+        axes=[
+            {"name": name, "type": "space", "unit": unit} for unit, name in zip(inp_units, dim_names)
+        ],
+        type="labels"
+    )
+    
+    # z = labels_root.require_array(
+    #     "0",
+    #     shape=array.shape,
+    #     chunks=chunk_shape,
+    #     dtype="int32",
+    #     dimension_names=dim_names
+    # )
+
+    down_shape = tuple(s // 2 for s in array.shape)
+    down_chunks = tuple(max(1, c // 2) for c in down_shape)
+
+    z1 = labels_root.require_array(
+    "0",
+    shape=down_shape,
+    chunks=down_chunks,
+    dtype="int32",
+    dimension_names=dim_names,
+    )
+
+    print(f"Initial empty array written at: {store_path}")
+    return None, z1
+
+
+def _generate_tiles(shape, tile_shape):
+    grids = [range(0, s, t) for s, t in zip(shape, tile_shape)]
+
+    for coords in np.ndindex(*[len(g) for g in grids]):
+        yield tuple(
+            slice(grids[d][coords[d]],
+                  min(grids[d][coords[d]] + tile_shape[d], shape[d]))
+            for d in range(len(shape))
         )
-    print(f"Initial empty array written at: {dest_path}")
-    return z
-
-    # ome.zar json tells about multiscale resolutions
-
-
-def chunk_slices(chunks):
-    bounds = []
-    for c in chunks:
-        starts = np.cumsum((0,) + c[:-1])
-        bounds.append([slice(s, s + size) for s, size in zip(starts, c)])
-    return bounds
-

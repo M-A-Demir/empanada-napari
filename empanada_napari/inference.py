@@ -64,6 +64,19 @@ def stack_postprocessing(
     dtype=np.uint32,
     chunk_size=(256, 256, 256)
 ):
+    yield from _stack_postprocessing(trackers, store_url, model_config,
+                label_divisor, min_size, min_extent, dtype, chunk_size)
+
+def _stack_postprocessing(
+    trackers,
+    store_url,
+    model_config,
+    label_divisor=1000,
+    min_size=200,
+    min_extent=4,
+    dtype=np.uint32,
+    chunk_size=(256, 256, 256)
+):
     r"""Relabels and filters each class defined in trackers. Yields a numpy
     or zarr volume along with the name of the class that is segmented.
     """
@@ -108,8 +121,26 @@ def stack_postprocessing(
 
         yield stack_vol, class_name, stack_tracker.instances
 
+
 @thread_worker
 def tracker_consensus(
+    trackers,
+    store_url,
+    model_config,
+    label_divisor=1000,
+    pixel_vote_thr=2,
+    cluster_iou_thr=0.75,
+    allow_one_view=False,
+    min_size=200,
+    min_extent=4,
+    dtype=np.uint32,
+    chunk_size=(256, 256, 256)
+):
+    yield from _tracker_consensus(trackers, store_url, model_config,
+                label_divisor, pixel_vote_thr, cluster_iou_thr,
+                allow_one_view, min_size, min_extent, dtype, chunk_size)
+
+def _tracker_consensus(
     trackers,
     store_url,
     model_config,
@@ -488,9 +519,7 @@ class Engine3d:
 
         return stack
 
-    def infer_on_axis(self, volume, axis_name):
-        print("!!!! VOLDTYPE", type(volume), volume[:5])
-        
+    def infer_on_axis(self, volume, axis_name):       
         axis = self.axes[axis_name]
         # create the dataloader
         dataset = VolumeDataset(volume, axis, self.preprocessor, scale=self.inference_scale)
@@ -499,8 +528,6 @@ class Engine3d:
             drop_last=False, num_workers=0
         )
 
-        print("DSETLOADER: ", type(dataset), type(dataloader))
-
         # create necessary matchers and trackers
         trackers = self.create_trackers(volume.shape, axis_name)
         matchers = create_matchers(
@@ -508,9 +535,6 @@ class Engine3d:
             self.merge_iou_thr, self.merge_ioa_thr
         )
         stack = self.create_panoptic_stack(axis_name, volume.shape)
-
-        print("PANOPTICSAVE:", self.save_panoptic)
-        print("FIRST STACK:", type(stack))
 
         if platform.system() == "Darwin":
             try:
