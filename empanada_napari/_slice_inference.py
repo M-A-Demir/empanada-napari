@@ -3,11 +3,13 @@ import sys
 import joblib
 import numpy as np
 import dask.array as da
+import ome_zarr
 import ome_zarr_models
 import zarr
 from time import time
 from tqdm import tqdm
 from skimage.draw import polygon
+from skimage.transform import resize
 
 from empanada.config_loaders import read_yaml
 from empanada_napari.inference import Engine2d
@@ -20,6 +22,7 @@ from time import time
 from tqdm import tqdm
 from skimage.draw import polygon
 from ome_zarr_models import open_ome_zarr
+from scipy.ndimage import binary_dilation
 
 from empanada.config_loaders import read_yaml
 from empanada_napari.inference import Engine2d
@@ -135,7 +138,7 @@ class SliceInference:
             return
 
     def _zarr_seg_workflow(self, image, axis, plane, y, x):
-        store_path = '/home/efv97572/empanada_tem/2dout2.ome.zarr'
+        store_path = '/home/efv97572/empanada_tem/2dout3.ome.zarr'
         # Create OME-Zarr store with empty array with same shape as image, and an array == downsampled-by-2 
         zout, zout_down = _write_empty_chunk(store_path, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
         
@@ -146,15 +149,25 @@ class SliceInference:
         chunk_indices = list(_generate_tiles(image_down.shape, tile_shape))
         print("CHUNK INDICES:", image_down.shape, chunk_indices)
 
+        ### ClassIDs based on chunk indices:
+        self.class_ids = {}
+        class_id = 1
+        divisor = 1000
+        for chunk_idx in chunk_indices:
+            id = chunk_idx[0].start + chunk_idx[1].stop
+            print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
+            self.class_ids[id] = class_id*divisor
+            class_id += 1
+
         # Second, run inference on the panels in parallel
         delayed_run_segmentation = joblib.delayed(self.run_segmentation)
         jobs = [delayed_run_segmentation(image_down[idx], axis, plane, y, x, zout_down, idx) for idx in chunk_indices]
         for job in jobs: print("Job:", job)
         executor = joblib.Parallel(n_jobs=-1, backend='threading')
-        executor(jobs) 
+        # executor(jobs) 
         
         # Third, Get the strips along the panel "seams" & run segmentation
-        pad = 100
+        pad = 400
         y_chunk = image_down.shape[0]//2
         x_chunk = image_down.shape[1]//2
 
@@ -162,30 +175,68 @@ class SliceInference:
         h_idx = (slice(y_chunk-pad, y_chunk+pad, None), slice(0, image_down.shape[1], None))
         vertical_strip = image_down[v_idx]
         horizontal_strip = image_down[h_idx]
+
+        for chunk_idx in [v_idx, h_idx]:
+            id = chunk_idx[0].start + chunk_idx[1].stop
+            print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
+            self.class_ids[id] = class_id*divisor
+            class_id += 1
+
+        print("ClassIDs:", self.class_ids, len(chunk_indices))
+        sys.exit()
+
+        print("STRIP ARRAY SHAPE (Expect: (1414, 800))", vertical_strip, horizontal_strip)
         
-        self.run_segmentation(vertical_strip, axis, plane, y, x, zout_down, v_idx)
-        self.run_segmentation(horizontal_strip, axis, plane, y, x, zout_down, h_idx)
+        self.run_segmentation(vertical_strip, axis, plane, y, x, zout_down, v_idx, merge_labels=True)
+        self.run_segmentation(horizontal_strip, axis, plane, y, x, zout_down, h_idx, merge_labels=True)
 
         # Fourth, Merge the overlapping labels
 
 
         # Fifth, use this array and upscale it to get the highest res array, DO NOT RE-SEGMENT
         # Load the coordinate transforms from the original dataset:
-        path = "test_path.ome.zarr"
-        coord_transforms = self._load_ome_zarr(path)
+        '''path = "test_path.ome.zarr"
+        multiscales, coord_transforms = self._load_ome_zarr(path)
+        axes = multiscales[0]['axes']
+        dim_names = [ax['name'] for ax in axes]
+
+        scale_factors = [dict() for _ in coord_transforms]
+        for idx, ds in enumerate(coord_transforms):
+            axis_scale = ds['coordinateTransformations'][0]['scale']
+
+            for dim, scale in zip(dim_names, axis_scale):
+                if dim in ('y', 'x'):
+                    scale_factors[idx][dim] = scale
 
         # We have the scales per transform, just get this as a list:
-        # 
+        
 
-        for transform in coord_transforms:
+        # First, reshape the downscaled labels array to the full res shape:
+        if zout_down.shape != image.shape:
+            full_seg = resize(zout_down, (image.shape[0], image.shape[1]), order=0, 
+                             mode='reflect', anti_aliasing=True, preserve_range=True)
+        else:
+            full_seg = zout_down
+
+
+        # Now we have the full seg, we can write it out to the zarr store
+        # (NOTE: we may want to do the above resizing CHUNKWISE and write directly to ome-zarr store!)
+        # We can call the zout_down store something like 'temp' in the outfile, and delete it later
+
+        ome_zarr.writer.write_image(image=full_seg, scale_factors=scale_factors) 
+
+        for transform in scale_factors:
             # create the zarr store per transform:
-            scale = transform['coordinateTransformations'][0]['scale'] #= [1.0, 1.0, 0.008, 0.005, 0.005]
             zout_prop = _write_empty_chunk(store_path, image, inp_scale=scale, overwrite=False) # inp_scale needs to come from input image zarr store
-    
-            # First get the array:
-            downsampled_seg = zout_down * scale # This probably isn't correct
+
+            # First resize the zout_down array:
+            resized_seg = resize(
+                zout_down, (zout_down.shape[0]*2, zout_down.shape[1]*2), order=0, mode='reflect', 
+                anti_aliasing=True, preserve_range=True)
+        '''
 
         # Sixth, get the other samplings across the other resolutions in the original too
+
         # Done  
                 
 
@@ -202,9 +253,9 @@ class SliceInference:
         return da.from_zarr(zout_down)
 
 
-    def run_segmentation(self, input_array, axis, plane, y, x, zarr_store=None, slice_idx=None):
+    def run_segmentation(self, input_array, axis, plane, y, x, zarr_store=None, slice_idx=None, merge_labels=False):
         if isinstance(input_array, da.Array):
-            input_array = input_array.compute()
+            input_array = input_array.compute() 
 
         if self.batch_mode:
             assert not self.output_to_layer, "Batch mode is not compatible with output to layer!"
@@ -220,38 +271,110 @@ class SliceInference:
         else:
             seg, axis, plane, y, x = self._run_model(self.engine, input_array, axis, plane, y, x, self.fill_holes)
 
-        # if isinstance(input_array, da.Array):
-            #zarr_store[slice_idx] = seg
-            #return
-        # return seg, axis, plane, y, x
+        if zarr_store is not None:
+            # Get this chunk's classID:
+            id = slice_idx[0].start + slice_idx[1].stop
+            class_id = self.class_ids[id]
+            old_divisor = self.maximum_objects_per_class
 
-        print("!!!Z", input_array.shape, seg.shape, slice_idx)
+            unique_labels = np.unique(seg[seg>0])
 
-        existing = zarr_store[slice_idx]
-        mask = (seg > 0) & (existing == 0) # True (Replace label) if seg value is greater than 0, and existing value is 0
-        existing[mask] = seg[mask]
-        zarr_store[slice_idx] = existing 
-
-        # Merge overlapping labels into same label?
-
-        pairs = np.column_stack([
-            existing[mask],
-            seg[mask]
-        ])
-
-        offset = existing.max() + 100
-        rows = pairs[:, 0]
-        cols = pairs[:, 1] + offset
-
-        graph = sparse.coo_matrix(
-            (np.ones(len(rows)), (rows, cols))
-        )
-
-        n_components, labels = connected_components(graph, directed=False)
+            # Update all labels in seg to be class_id
+            mapping = {
+                old_label: (old_label-old_divisor)+class_id
+                for old_label in unique_labels
+            }
+            seg = self.apply_mapping(seg, mapping)
 
 
-        return
+            if not merge_labels:
+                print("not merging labels")
+                final = seg
+        
+            else:
+                print("merging labels...")
+                # Merge overlapping labels into same label
+                existing = zarr_store[slice_idx]
+                print("!!!Z", input_array.shape, existing.shape, seg.shape, slice_idx)
 
+                seg2_to_seg1 = self.build_mapping(existing, seg)
+                seg2_fixed = self.apply_mapping(seg, seg2_to_seg1)
+
+                final = existing.copy()
+                mask = seg2_fixed > 0
+                final[mask] = seg2_fixed[mask]
+                print("Saving...")
+
+            zarr_store[slice_idx] = final
+            
+            return
+            
+        return seg, axis, plane, y, x
+
+
+    def apply_mapping(self, seg, mapping):
+        out = seg.copy()    
+        for old, new in mapping.items():
+            out[seg == old] = new   
+        return out
+
+    def build_mapping(self, seg1, seg2, min_conf=0.8):
+        mapping = {}
+        seg2_labels = np.unique(seg2[seg2>0])
+
+        for l2 in seg2_labels:
+            mask = seg2 == l2
+
+            overlap = seg1[mask]
+            overlap = overlap[overlap > 0]
+
+            if len(overlap) == 0:
+                continue
+
+            labels, counts = np.unique(overlap, return_counts=True)
+
+            best = np.argmax(counts)
+            best_label = labels[best]
+
+            conf = counts[best] / counts.sum()
+
+            if conf >= min_conf:
+                mapping[l2] = best_label
+
+        return mapping
+
+    def align_seg2_to_seg1(self, seg1, seg2, min_overlap=0.5):
+        """
+        For each seg2 label:
+            assign it the seg1 label it overlaps most
+        """
+
+        seg2_out = np.zeros_like(seg2)
+
+        seg2_labels = np.unique(seg2)
+        seg2_labels = seg2_labels[seg2_labels > 0]
+
+        for l2 in seg2_labels:
+
+            mask = seg2 == l2
+
+            overlap = seg1[mask]
+            overlap = overlap[overlap > 0]
+
+            if len(overlap) == 0:
+                continue
+
+            labels, counts = np.unique(overlap, return_counts=True)
+
+            best_idx = np.argmax(counts)
+            best_label = labels[best_idx]
+
+            confidence = counts[best_idx] / counts.sum()
+
+            if confidence >= min_overlap:
+                seg2_out[mask] = best_label
+
+        return seg2_out
 
     def _load_ome_zarr(self, path: str) -> None:
         """
@@ -267,7 +390,7 @@ class SliceInference:
         multiscales = group.attrs["multiscales"]
         datasets = multiscales[0]["datasets"]
 
-        return datasets
+        return multiscales, datasets
         
 
     # ---------------- Engine management ----------------
