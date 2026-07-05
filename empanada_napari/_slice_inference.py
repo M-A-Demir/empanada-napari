@@ -99,7 +99,7 @@ class SliceInference:
         self._check_option_compatibility()
 
     # ---------------- Option handling & inference running entrypoint ----------------
-    def config_and_run_inference(self, use_thread=False):  
+    def config_and_run_inference(self):  
         # Load the model config
         model_configs = get_configs()
         self.model_config = read_yaml(model_configs[self.model_config_name])
@@ -117,22 +117,14 @@ class SliceInference:
         image, axis, plane, y, x = self._get_image_as_array(self.image_layer)
         print(image.shape, self.image_layer.shape)
 
-        # import tifffile as tiff
-        # timg = tiff.imread('/home/efv97572/empanada_tem/10311-IM1-chunk2.tiff')
-        # print(np.array_equal(image, timg[223]), timg.shape)
-      
-
         # Need a condition that the array should meet to run inference over tiles... maybe arr size?
         if type(image) == da.core.Array:
+            # Create a ParallelExecutor object
+            # Call its run_workflow(engine, image, scale, axis, plane, y, x) method
+            # Return its outstore? or outarray?
             out_store = self._zarr_seg_workflow(image, axis, plane, y, x)
 
             return out_store
-        
-            # First pass: Get the slice, Downsample the array to 16, 
-            # Rechunk the array into the biggest size possible
-            # We will initially try with 2x2 (4 panels total)
-            # Configure the engine
-            # Write out the seg to labels/segmentation/16/ 
 
 
         else: # temporarily skip non-zarr files
@@ -141,7 +133,7 @@ class SliceInference:
     def _zarr_seg_workflow(self, image, axis, plane, y, x):
         store_path = '/home/efv97572/empanada_tem/2dout4.ome.zarr'
         # Create OME-Zarr store with empty array with same shape as image, and an array == downsampled-by-2 
-        zout, zout_down = _write_empty_chunk(store_path, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
+        zout_down = _write_empty_chunk(store_path, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
         
         # First, downsample the 'image' array and rechunk it into 4 panels
         image_down = image[::2, ::2]# da.coarsen(np.mean, image, { -2: 2, -1: 2 })
@@ -185,23 +177,9 @@ class SliceInference:
 
         # print("ClassIDs:", self.class_ids, len(chunk_indices))
 
-        # print("STRIP ARRAY SHAPE (Expect: (1414, 800))", vertical_strip, horizontal_strip)
-        
         self.run_segmentation(vertical_strip, axis, plane, y, x, zout_down, v_idx, merge_labels=True)
         self.run_segmentation(horizontal_strip, axis, plane, y, x, zout_down, h_idx, merge_labels=True)
 
-        # Adjust label naming based on max class
-        # max_classes means that there can be a max of x labels in a class,
-        # if more, put in a new label class (i.e. 1xxx, 2xxx, 3xxx or 1xx, 2xx, 3xx)
-        # We have our full array with labels put into classes based on chunks
-        # So currently I have the full array with all labels, but I also have the original labels map thing
-
-        # We know the number of unique labels in total (np.unique(zarr_out[zarr_out>0]))
-        # We divide this number by max_classes - 1223 labels // 100 = 12 classes
-        # labels in class 1 = 100+class_ID, labels in class 2 = 200+class_ID
-        # The first 100 labels in np.unique will map to ID=100 to 199
-        # The second 100 labels will map to ID= 200 to 299
-        # Once we build this map (dict), we can just apply it in chunks to every label
 
         # 1. Get a list of unique labels from the zarr out array
         downseg = da.from_zarr(f"{store_path}/labels/tmp/s0/") 
@@ -213,16 +191,7 @@ class SliceInference:
         num_classes = math.ceil(len(unique_labels)/self.maximum_objects_per_class)
         # Turn this into an int array
         new_ids = []
-        # If we have 1 class, the min_id = 1000(+1, the first object_ID)
-        # Max ID is second class' ID -1 = 2000-1
-            # If we have less unique labels than objects in class,
-            # The max_id should be class_id+len(unique_labels)
-            # i.e. if we have 51 labels, 1000+51+1 = 1052
-        # if we had 2004 labels, max_id would be 2999
-            # Instead, max label should be
-            # len(labels)%(num_classes-1*max_objects) = 2004/2000
-            # The number/remainder is how many items are in the last class
-            # This+1 should be the last label ID 
+     
         for class_id in range(1, num_classes+1):
             min_id = (class_id*self.maximum_objects_per_class) + 1
             max_id = ((class_id+1) * self.maximum_objects_per_class) - 1
@@ -231,12 +200,10 @@ class SliceInference:
                 max_obj_id = len(unique_labels)+1 % max(num_classes-1, 1) 
                 max_id = max_obj_id + (class_id*self.maximum_objects_per_class)
 
-            # print("DEBUGGING IDs:", min_id, max_id, num_classes, class_id)
             new_ids.extend(np.arange(min_id, max_id))
 
         # 3. Unique_labels is already sorted, as is new_ids
         id_map = dict(zip(unique_labels, new_ids))
-        # print("ID MAP????", new_ids, unique_labels, id_map)
 
         # Build a global LookUp Table:
         max_key = max(unique_labels)
@@ -259,17 +226,7 @@ class SliceInference:
         image_store = "https://bioimaging-01-pub.livingobjects.ebi.ac.uk/phase1test/EMPIAR-10311-IM1.zarr"  #The original image's zarr store
         self.write_out_multiscale(image_store, image, store_path, zout_down)
 
-        # Done  
-                
-
-        # chunk_indices = list(slices_from_chunks(image.chunks))
-        # print("CHUNK IDICES:", image_down.shape, chunk_indices)
-
-        
-        # if len(jobs)>1:
-        #     jobs = jobs[:1]
-    
-        
+        # Done.   
 
         print("Segmentation Done.")
         return da.from_zarr(zout_down)
@@ -440,7 +397,6 @@ class SliceInference:
         multiscales, coord_transforms = self._load_ome_zarr(image_store)
         axes = multiscales[0]['axes']
         dim_names = [ax['name'] for ax in axes if ax['name'] in ('y', 'x')]
-        print("?????", axes, dim_names)
 
         abs_scales = []
         scale_factors = [dict() for _ in coord_transforms]
@@ -576,21 +532,38 @@ class SliceInference:
 
             return image[tuple(slices)], axis, plane, y, x
                 
+    def _check_option_compatibility(self):
+        if quantized_supported == False and self.using_quantized:
+            raise RuntimeWarning(
+                "No quantized backend is selected. " \
+                f"torch.backends.quantized.engine = {engine}" \
+                "Using Quantized Model may fail."
+            )
 
-    def _fill_holes_in_segmentation(self, mask):
-        unique_indices = np.unique(mask)
-        rprops = measure.regionprops(mask)
+        if self.output_to_layer:
+            assert self.output_layer is not None, "Must select an output layer or uncheck Output to layer!"
+            assert self.output_layer.data.shape == self.image_layer.data.shape, \
+                "Output layer must have the same shape as the input image."
+            assert self.viewport is False, "Cannot output to layer and restrict to viewport at the same time."
 
-        # crop labels and then apply fill holes
-        for rp in tqdm(rprops, desc='filling holes in labels:'):
-            if rp.label in unique_indices and rp.label > 0:
-                minr, minc, maxr, maxc = rp.bbox
+        if self.batch_mode:
+            assert self.viewport is False, "Cannot use batch mode and restrict to viewport at the same time."
+            assert not self.output_to_layer, "Batch mode is not compatible with output to layer!"
+            assert not self.image_layer.multiscale, "Batch mode is not compatible with multiscale images!"
+            assert not self.viewport, "Batch mode is not compatible with viewport inference!"
+            assert not self.confine_to_roi, "Batch mode is not compatible with ROI inference!"
 
-                tmp = mask[minr:maxr, minc:maxc]
-                tmp = binary_fill_holes(tmp.astype(bool))
-                mask[minr:maxr, minc:maxc] = tmp.astype(mask.dtype) * rp.label
-        return mask
-    
+        if self.viewport:
+            assert all(s == 1 for s in
+                       self.image_layer.scale), "Viewport inference only supports images with scale 1 in all dimensions!"
+            assert self.viewer.dims.order[0] != 1, "Viewport inference not supported for xz planes!"
+
+        # if not all(s == 1 for s in self.image_layer.scale):
+            # print(f'Image has non-unit scale. 2D segmentations will disappear after rotation or axis rolling!')
+        return
+
+
+    # Stuff for GUI Ver:
     def _viewer_slices(self, image_layer, plane=None, axis=None):
         corners = image_layer.corner_pixels.T.tolist()
         if isinstance(axis, tuple) and isinstance(plane, tuple):
@@ -694,94 +667,28 @@ class SliceInference:
         mask = self._get_mask_from_roi(image_layer, shapes_layer)
         return roi, min_y, min_x, max_y, max_x, mask[min_y:max_y, min_x:max_x]
     
-    def _check_option_compatibility(self):
-        if quantized_supported == False and self.using_quantized:
-            raise RuntimeWarning(
-                "No quantized backend is selected. " \
-                f"torch.backends.quantized.engine = {engine}" \
-                "Using Quantized Model may fail."
-            )
 
-        if self.output_to_layer:
-            assert self.output_layer is not None, "Must select an output layer or uncheck Output to layer!"
-            assert self.output_layer.data.shape == self.image_layer.data.shape, \
-                "Output layer must have the same shape as the input image."
-            assert self.viewport is False, "Cannot output to layer and restrict to viewport at the same time."
 
-        if self.batch_mode:
-            assert self.viewport is False, "Cannot use batch mode and restrict to viewport at the same time."
 
-        if self.viewport:
-            assert all(s == 1 for s in
-                       self.image_layer.scale), "Viewport inference only supports images with scale 1 in all dimensions!"
-            assert self.viewer.dims.order[0] != 1, "Viewport inference not supported for xz planes!"
+class SliceInferenceWidget(SliceInference):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-        # if not all(s == 1 for s in self.image_layer.scale):
-            # print(f'Image has non-unit scale. 2D segmentations will disappear after rotation or axis rolling!')
-        return
 
-    # ---------------- Inference runners ----------------
-    @thread_worker
-    def run_model(self, engine, image, axis, plane, y, x, fill_holes):
-        return self._run_model(engine, image, axis, plane, y, x, fill_holes)
 
-    @thread_worker
-    def run_model_batch(self, engine, image, fill_holes):
-        return self._run_model_batch(engine, image, fill_holes)
-    
-    def _run_model(self, engine, image, axis, plane, y, x, fill_holes):
-        # create the inference engine
-        start = time()
-        seg = engine.infer(image)
-        if fill_holes:
-            seg = self._fill_holes_in_segmentation(seg)
-        print(f'Inference time:', time() - start)
-        return seg, axis, plane, y, x
 
-    def _run_model_batch(self, engine, image, fill_holes):
-        # axis is always xy
-        axis = 0
+# ---------------- Napari GUI wrapper ----------------
+def slice_inference_widget():
+    """
+    Factory function to create the widget for Napari.
+    This is what Napari will call.
+    """
+    from napari.layers import Image, Labels
+    from magicgui import widgets
 
-        # create the inference engine
-        if image.ndim == 3:
-            print(f'Running batch mode inference on {len(image)} images.')
-            segmentations = []
-            for plane, img_slice in tqdm(enumerate(image), total=len(image)):
-                if type(img_slice) == da.core.Array:
-                    img_slice = img_slice.compute()
+    logo = abspath(__file__, 'resources/empanada_logo.png')
+    model_configs = get_configs()
 
-                seg = engine.infer(img_slice)
-                if fill_holes:
-                    seg = self._fill_holes_in_segmentation(seg)
-                segmentations.append(seg)
-
-            # stack segmentations with padding
-            max_h = max(seg.shape[0] for seg in segmentations)
-            max_w = max(seg.shape[1] for seg in segmentations)
-            padded = []
-            for seg in segmentations:
-                h, w = seg.shape
-                padh, padw = max_h - h, max_w - w
-                padded.append(np.pad(seg, ((0, padh), (0, padw))))
-
-            padded = np.stack(padded, axis=0)
-            return padded
-
-        elif image.ndim == 2:
-            start = time()
-            if type(image) == da.core.Array:
-                image = image.compute()
-
-            plane = 0
-            seg = engine.infer(image)
-            if fill_holes:
-                seg = self._fill_holes_in_segmentation(seg)
-            print(f'Inference time:', time() - start)
-            return seg, None, None, None, None
-        
-        else:
-            raise Exception(f'Batch mode supports 2d and 3d, got {image.ndim}d.')
-    
     # ---------------- GUI result functions ----------------
     def _show_batch_stack(self, *args):
         stack = args[0]
@@ -853,28 +760,6 @@ class SliceInference:
 
         self.pbar.hide()
 
-
-
-class SliceInferenceWidget(SliceInference):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-
-
-
-
-
-# ---------------- Napari GUI wrapper ----------------
-def slice_inference_widget():
-    """
-    Factory function to create the widget for Napari.
-    This is what Napari will call.
-    """
-    from napari.layers import Image, Labels
-    from magicgui import widgets
-
-    logo = abspath(__file__, 'resources/empanada_logo.png')
-    model_configs = get_configs()
 
     # define magicgui params
     gui_params = dict(

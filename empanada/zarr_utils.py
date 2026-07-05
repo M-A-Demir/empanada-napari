@@ -317,7 +317,7 @@ def _write_empty_chunk(store_path, image, level=1, inp_scale=None, inp_units=Non
                     )
 
     print(f"Initial empty array written at: {store_path}/labels/{name}/{array_name}")
-    return None, z1
+    return z1
 
 
 def _write_multiscale(store_path, full_seg, scale_factors, multidims, datasets, axes):
