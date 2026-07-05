@@ -26,6 +26,7 @@ from ome_zarr_models import open_ome_zarr
 from scipy.ndimage import binary_dilation
 
 from empanada.config_loaders import read_yaml
+from empanada.seg_executors import SerialExecutor, ParallelExecutor
 from empanada_napari.inference import Engine2d
 from empanada_napari.utils import get_configs, abspath
 from empanada.zarr_utils import _write_empty_chunk, _generate_tiles, _write_multiscale
@@ -98,37 +99,34 @@ class SliceInference:
 
         self._check_option_compatibility()
 
-    # ---------------- Option handling & inference running entrypoint ----------------
-    def config_and_run_inference(self):  
-        # Load the model config
+    # ---------------- Pipeline running entrypoint ----------------
+    def config_and_run_inference(self, zarr_inpath=None, zarr_outpath=None):  
+        '''Step 1: Load the model config'''
         model_configs = get_configs()
         self.model_config = read_yaml(model_configs[self.model_config_name])
 
         if self.last_config is None:
             self.last_config = self.model_config_name
 
-        if isinstance(self.image_layer, da.Array) and self.downsampling==1:
-            self.downsampling = 1 #6
-            print(f"Running initial pass on downsampled image. Downsampling: {self.downsampling}")
-
+        '''Step 2: Setup the Engine'''
         self.get_engine()
                 
-        # Get the 2d slice from the image (Can mock a layer/viewer object in the tests)
+        '''Step 3: Get the 2D slice from the image array'''
         image, axis, plane, y, x = self._get_image_as_array(self.image_layer)
         print(image.shape, self.image_layer.shape)
 
-        # Need a condition that the array should meet to run inference over tiles... maybe arr size?
-        if type(image) == da.core.Array:
-            # Create a ParallelExecutor object
-            # Call its run_workflow(engine, image, scale, axis, plane, y, x) method
-            # Return its outstore? or outarray?
-            out_store = self._zarr_seg_workflow(image, axis, plane, y, x)
+        '''Step 4: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
+        if type(image) == da.core.Array and zarr_inpath and zarr_outpath:
+            scale=2
+            executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes)
+        else:
+            executor = SerialExecutor(self.fill_holes)
 
-            return out_store
-
-
-        else: # temporarily skip non-zarr files
-            return
+        '''Step 5: Return the computed segmentation array'''
+        seg, axis, plane, y, x = executor.run_workflow(self.engine, image, axis, plane, y, x)
+   
+        return seg, axis, plane, y, x
+    
 
     def _zarr_seg_workflow(self, image, axis, plane, y, x):
         store_path = '/home/efv97572/empanada_tem/2dout4.ome.zarr'

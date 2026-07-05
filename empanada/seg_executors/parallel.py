@@ -12,11 +12,13 @@ class ParallelExecutor(Executor):
     def __init__(self,
                  zarr_inpath=None,
                  zarr_outpath=None,
+                 scale=2,
                  fill_holes_in_segmentation=False
                  ):
         super().__init__(fill_holes_in_segmentation)
         self.zarr_inpath = zarr_inpath
         self.zarr_outpath = zarr_outpath
+        self.scale=2 # Downsampling scale to use for the full arr
         self.class_ids = {}
 
     def _get_zarr_metadata(self):
@@ -25,41 +27,44 @@ class ParallelExecutor(Executor):
         # This should ... figure out what we need later
 
 
-    def run_workflow(self, engine, image, scale=2, axis=None, plane=None, y=None, x=None):
-        # First, get the downsampled array & chunks
-        image = self._downsample_array(image, scale)
-        tile_shape = [dim for dim in image.shape]
+    def run_workflow(self, engine, image, axis=None, plane=None, y=None, x=None):
+        '''This method is the entrypoint for running the parallel segmentation workflow'''
+        
+        '''Step 1: Compute the downsampled array & 4-panel chunks'''
+        image = self._downsample_array(image, self.scale)
+        tile_shape = [dim//2 for dim in image.shape]
         chunk_indices = list(_generate_tiles(image.shape, tile_shape))
 
-        # Get the class IDs:
+        '''Step 2: Create the initial class IDs'''
         self._create_class_ids(chunk_indices)
 
-        # Next, initialise the empty labels/tmp store/array
+        '''Step 3: Initialise the empty labels/tmp store/array'''
         # May want to pass whatever writer metadata we want to this func later
         zout_tmp = _write_empty_chunk(self.zarr_outpath, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
 
-        # Call a method that can get seg, and update label (Change to delayed func later)
+        '''Step 4: Run parallel segmentation on the chunks and handle labels'''
         self.process_segmentation_chunk(engine, image, axis, plane, y, x, 
                                    zout_tmp, slice_idx=None, 
                                    merge_labels=False)
         
-        # Compute the strips across the panel seams
+        '''Step 5: Compute the strips arrays and indices across the panel seams'''
         strip_arrays = self._get_strips(chunk_sizes, padding=200)
 
-        # Get their class IDs too:
+        '''Step 6: Create their class IDs too'''
         self._create_class_ids(strip_arrays)
 
-        # Call the chunk processor in serial for strip arrays:
+        '''Step 7: Run serial segmentation on the strips and handle labels'''
         for key in strip_arrays.keys():
             strip = strip_arrays[key]
             self.process_segmentation_chunk(engine, strip, axis, plane, y, x, 
                                    zout_tmp, slice_idx=None, 
-                                   merge_labels=False)
+                                   merge_labels=True)
             
-        # Call ID reconciler
+        '''Step 8: Perform global label reconciliation in parallel'''
         tmp_array = self.zarr_outpath+"/labels/tmp/s0"
         self._reconcile_labels(tmp_array)    
 
+        '''Step 9: Create and write out the final multiscale segmentation arrays'''
         # Use this array to write the multiscales - Do I even need 'image' if I just pass the original image's shapes?
         self.write_out_multiscale(self.zarr_inpath, image, self.zarr_outpath, image)
         # maybe make write_out_multiscale return the seg path or array
