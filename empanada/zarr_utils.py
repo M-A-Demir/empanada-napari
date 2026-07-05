@@ -268,8 +268,11 @@ import ome_zarr.writer
 import ome_zarr.io
 import ome_zarr_models
 
-def new_write_empty_chunk(store_path, array, level=1, inp_scale=None, inp_units=None):
-    ndims = array.ndim
+
+def _write_empty_chunk(store_path, image, level=1, inp_scale=None, inp_units=None, overwrite=True):
+    # TO-DO: If overwrite=False, don't recreate the root
+    
+    ndims = image.ndim
     dim_names = ["z", "y", "x"][-1*ndims:]
     if inp_scale is None:
         inp_scale = [1]*ndims
@@ -279,101 +282,87 @@ def new_write_empty_chunk(store_path, array, level=1, inp_scale=None, inp_units=
         inp_units = [str(u) for u in inp_units]
         inp_scale = list(inp_scale)
 
-    root = zarr.open_group(store_path, mode="w", zarr_format=3)
+    name = "tmp"
+    array_name = "s0"
 
-    chunk_shape = tuple(c[0] for c in array.chunks)
-    
-    root.attrs["labels"] = ["segmentation"]
-    labels_root = root.require_group("labels/segmentation")
-
-    ome_zarr.writer.write_multiscales_metadata(
-        labels_root,
-        datasets=[
-            {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": inp_scale}]}, #inp_scale[-1*ndims:]}]},
-            {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": [n*2 for n in inp_scale]}]} #inp_scale[-1*ndims:]}]}
-            ],
-        axes=[
-            {"name": name, "type": "space", "unit": unit} for unit, name in zip(inp_units, dim_names)
-        ],
-        type="labels"
-    )
-    
-    z = labels_root.require_array(
-        "0",
-        shape=array.shape,
-        chunks=chunk_shape,
-        dtype="int32",
-        dimension_names=dim_names
-    )
-
-    down_shape = tuple(s // 2 for s in array.shape)
-    down_chunks = tuple(max(1, c // 2) for c in down_shape)
-
-    z1 = labels_root.require_array(
-    "1",
-    shape=down_shape,
-    chunks=down_chunks,
-    dtype="int32",
-    dimension_names=dim_names,
-    )
-
-    print(f"Initial empty array written at: {store_path}")
-    return z, z1
-
-
-def _write_empty_chunk(store_path, array, level=1, inp_scale=None, inp_units=None, overwrite=True):
-    # TO-DO: If overwrite=False, don't recreate the root
-    
-    ndims = array.ndim
-    dim_names = ["z", "y", "x"][-1*ndims:]
-    if inp_scale is None:
-        inp_scale = [1]*ndims
-    if inp_units is None:
-        inp_units = ["pixel"]*ndims
-    else:
-        inp_units = [str(u) for u in inp_units]
-        inp_scale = list(inp_scale)
+    datasets=[
+        {"path": array_name, "coordinateTransformations": 
+         [{"type": "scale", "scale": [n*2 for n in inp_scale]}]}
+            ]
+    axes=[{"name": nm, "type": "space", "unit": unit} 
+          for unit, nm in zip(inp_units, dim_names)]
 
     root = zarr.open_group(store_path, mode="w", zarr_format=3)
-
-    chunk_shape = tuple(c[0] for c in array.chunks)
     
-    root.attrs["labels"] = ["segmentation"]
-    labels_root = root.require_group("labels/segmentation")
+    root.attrs["labels"] = [name]
+    labels_root = root.require_group("labels")
+    label_group = labels_root.require_group(name)
 
     ome_zarr.writer.write_multiscales_metadata(
-        labels_root,
-        datasets=[
-            # {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": inp_scale[-1*ndims:]}]},
-            {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [n*2 for n in inp_scale]}]} #inp_scale[-1*ndims:]}]}
-            ],
-        axes=[
-            {"name": name, "type": "space", "unit": unit} for unit, name in zip(inp_units, dim_names)
-        ],
+        label_group,
+        datasets=datasets,
+        axes=axes,
         type="labels"
     )
-    
-    # z = labels_root.require_array(
-    #     "0",
-    #     shape=array.shape,
-    #     chunks=chunk_shape,
-    #     dtype="int32",
-    #     dimension_names=dim_names
-    # )
 
-    down_shape = tuple(s // 2 for s in array.shape)
+    down_shape = tuple(s // 2 for s in image.shape)
     down_chunks = tuple(max(1, c // 2) for c in down_shape)
 
-    z1 = labels_root.require_array(
-    "0",
-    shape=down_shape,
-    chunks=down_chunks,
-    dtype="int32",
-    dimension_names=dim_names,
-    )
+    z1 = label_group.require_array(
+                    array_name,
+                    shape=down_shape,
+                    chunks=down_chunks,
+                    dtype="int32",
+                    dimension_names=dim_names,
+                    )
 
-    print(f"Initial empty array written at: {store_path}")
+    print(f"Initial empty array written at: {store_path}/labels/{name}/{array_name}")
     return None, z1
+
+
+def _write_multiscale(store_path, full_seg, scale_factors, multidims, datasets, axes):
+    ndims = full_seg.ndim
+
+    root = zarr.open_group(store_path, mode="a", zarr_format=3)
+    seg_group = root.require_group("labels/seg")
+
+    # ome_zarr.writer.write_label_metadata()
+    
+    print("####WRITING METADATA:", scale_factors, "\n", axes, "\n", datasets)
+
+    write_label_pyramid_from_image(labels=full_seg, group=seg_group, 
+                                   scale_factors=scale_factors, multidims=multidims, axes=axes) 
+    
+
+    ome_zarr.writer.write_multiscales_metadata(group=seg_group, datasets=datasets, 
+                                                axes=axes, name="labels")
+    
+    ome = dict(seg_group.attrs.get("ome", {}))
+    ome["image-label"] = {"version": "0.5"}
+    seg_group.attrs["ome"] = ome
+    
+    return
+
+from skimage.transform import resize
+from ome_zarr.writer import write_multiscale
+
+def write_label_pyramid_from_image(labels, group, scale_factors, multidims, axes):
+    # 1. take scale factors, use to get the array dir names
+    path_nms = list(range(len(scale_factors)+1))
+
+    # 2. Iterate over the target shapes:
+    pyramid = []
+    for dims in multidims:
+        scaled_arr = resize(labels, dims, order=0, 
+                        mode='reflect', anti_aliasing=False, preserve_range=True)
+        pyramid.append(scaled_arr)
+        
+    # Write the downscaled array out
+    write_multiscale(
+        pyramid=pyramid,
+        group=group,
+        axes=axes      
+    )
 
 
 def _generate_tiles(shape, tile_shape):

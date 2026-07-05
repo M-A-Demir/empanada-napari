@@ -1,3 +1,4 @@
+import math
 import sys
 
 import joblib
@@ -27,7 +28,7 @@ from scipy.ndimage import binary_dilation
 from empanada.config_loaders import read_yaml
 from empanada_napari.inference import Engine2d
 from empanada_napari.utils import get_configs, abspath
-from empanada.zarr_utils import _write_empty_chunk, _generate_tiles
+from empanada.zarr_utils import _write_empty_chunk, _generate_tiles, _write_multiscale
 
 from napari import Viewer
 from napari.layers import Image, Labels, Shapes
@@ -116,9 +117,9 @@ class SliceInference:
         image, axis, plane, y, x = self._get_image_as_array(self.image_layer)
         print(image.shape, self.image_layer.shape)
 
-        import tifffile as tiff
-        timg = tiff.imread('/home/efv97572/empanada_tem/10311-IM1-chunk2.tiff')
-        print(np.array_equal(image, timg[223]), timg.shape)
+        # import tifffile as tiff
+        # timg = tiff.imread('/home/efv97572/empanada_tem/10311-IM1-chunk2.tiff')
+        # print(np.array_equal(image, timg[223]), timg.shape)
       
 
         # Need a condition that the array should meet to run inference over tiles... maybe arr size?
@@ -138,7 +139,7 @@ class SliceInference:
             return
 
     def _zarr_seg_workflow(self, image, axis, plane, y, x):
-        store_path = '/home/efv97572/empanada_tem/2dout3.ome.zarr'
+        store_path = '/home/efv97572/empanada_tem/2dout4.ome.zarr'
         # Create OME-Zarr store with empty array with same shape as image, and an array == downsampled-by-2 
         zout, zout_down = _write_empty_chunk(store_path, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
         
@@ -154,8 +155,8 @@ class SliceInference:
         class_id = 1
         divisor = 1000
         for chunk_idx in chunk_indices:
-            id = chunk_idx[0].start + chunk_idx[1].stop
-            print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
+            id = (chunk_idx[0].start + chunk_idx[1].stop)//100 * 100
+            # print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
             self.class_ids[id] = class_id*divisor
             class_id += 1
 
@@ -164,7 +165,7 @@ class SliceInference:
         jobs = [delayed_run_segmentation(image_down[idx], axis, plane, y, x, zout_down, idx) for idx in chunk_indices]
         for job in jobs: print("Job:", job)
         executor = joblib.Parallel(n_jobs=-1, backend='threading')
-        # executor(jobs) 
+        executor(jobs) 
         
         # Third, Get the strips along the panel "seams" & run segmentation
         pad = 400
@@ -177,65 +178,86 @@ class SliceInference:
         horizontal_strip = image_down[h_idx]
 
         for chunk_idx in [v_idx, h_idx]:
-            id = chunk_idx[0].start + chunk_idx[1].stop
-            print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
+            id = (chunk_idx[0].start + chunk_idx[1].stop)//100 * 100
+            # print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
             self.class_ids[id] = class_id*divisor
             class_id += 1
 
-        print("ClassIDs:", self.class_ids, len(chunk_indices))
-        sys.exit()
+        # print("ClassIDs:", self.class_ids, len(chunk_indices))
 
-        print("STRIP ARRAY SHAPE (Expect: (1414, 800))", vertical_strip, horizontal_strip)
+        # print("STRIP ARRAY SHAPE (Expect: (1414, 800))", vertical_strip, horizontal_strip)
         
         self.run_segmentation(vertical_strip, axis, plane, y, x, zout_down, v_idx, merge_labels=True)
         self.run_segmentation(horizontal_strip, axis, plane, y, x, zout_down, h_idx, merge_labels=True)
 
-        # Fourth, Merge the overlapping labels
+        # Adjust label naming based on max class
+        # max_classes means that there can be a max of x labels in a class,
+        # if more, put in a new label class (i.e. 1xxx, 2xxx, 3xxx or 1xx, 2xx, 3xx)
+        # We have our full array with labels put into classes based on chunks
+        # So currently I have the full array with all labels, but I also have the original labels map thing
+
+        # We know the number of unique labels in total (np.unique(zarr_out[zarr_out>0]))
+        # We divide this number by max_classes - 1223 labels // 100 = 12 classes
+        # labels in class 1 = 100+class_ID, labels in class 2 = 200+class_ID
+        # The first 100 labels in np.unique will map to ID=100 to 199
+        # The second 100 labels will map to ID= 200 to 299
+        # Once we build this map (dict), we can just apply it in chunks to every label
+
+        # 1. Get a list of unique labels from the zarr out array
+        downseg = da.from_zarr(f"{store_path}/labels/tmp/s0/") 
+        unique_labels = da.unique(downseg).compute()
+        if unique_labels[0] == 0:
+            unique_labels = unique_labels[1:] 
+
+        # 2. Get the number of classes we need, from self.maximum_objects_per_class
+        num_classes = math.ceil(len(unique_labels)/self.maximum_objects_per_class)
+        # Turn this into an int array
+        new_ids = []
+        # If we have 1 class, the min_id = 1000(+1, the first object_ID)
+        # Max ID is second class' ID -1 = 2000-1
+            # If we have less unique labels than objects in class,
+            # The max_id should be class_id+len(unique_labels)
+            # i.e. if we have 51 labels, 1000+51+1 = 1052
+        # if we had 2004 labels, max_id would be 2999
+            # Instead, max label should be
+            # len(labels)%(num_classes-1*max_objects) = 2004/2000
+            # The number/remainder is how many items are in the last class
+            # This+1 should be the last label ID 
+        for class_id in range(1, num_classes+1):
+            min_id = (class_id*self.maximum_objects_per_class) + 1
+            max_id = ((class_id+1) * self.maximum_objects_per_class) - 1
+
+            if max_id > len(unique_labels):
+                max_obj_id = len(unique_labels)+1 % max(num_classes-1, 1) 
+                max_id = max_obj_id + (class_id*self.maximum_objects_per_class)
+
+            # print("DEBUGGING IDs:", min_id, max_id, num_classes, class_id)
+            new_ids.extend(np.arange(min_id, max_id))
+
+        # 3. Unique_labels is already sorted, as is new_ids
+        id_map = dict(zip(unique_labels, new_ids))
+        # print("ID MAP????", new_ids, unique_labels, id_map)
+
+        # Build a global LookUp Table:
+        max_key = max(unique_labels)
+        lut = np.arange(max_key+1, dtype=np.int64)
+        for old, new in id_map.items():
+            lut[old] = new
+        
+        # 4. Apply the dict map in parallel, to each chunk in seg array 
+        # use the outseg zarr store (zout_down) & original chunk_indices
+        delayed_apply_mapping = joblib.delayed(self.apply_mapping)
+        jobs = [delayed_apply_mapping(downseg[idx], lut=lut, zarr_store=zout_down, slice_idx=idx) for idx in chunk_indices]
+        # Using downseg array here as input arr to be re-mapped? & writes out to zout_down? 
+        for job in jobs: print("Remapping Job:", job)
+        executor = joblib.Parallel(n_jobs=-1, backend='threading')
+        executor(jobs) 
+        '''Label reconciliation Done!'''
 
 
         # Fifth, use this array and upscale it to get the highest res array, DO NOT RE-SEGMENT
-        # Load the coordinate transforms from the original dataset:
-        '''path = "test_path.ome.zarr"
-        multiscales, coord_transforms = self._load_ome_zarr(path)
-        axes = multiscales[0]['axes']
-        dim_names = [ax['name'] for ax in axes]
-
-        scale_factors = [dict() for _ in coord_transforms]
-        for idx, ds in enumerate(coord_transforms):
-            axis_scale = ds['coordinateTransformations'][0]['scale']
-
-            for dim, scale in zip(dim_names, axis_scale):
-                if dim in ('y', 'x'):
-                    scale_factors[idx][dim] = scale
-
-        # We have the scales per transform, just get this as a list:
-        
-
-        # First, reshape the downscaled labels array to the full res shape:
-        if zout_down.shape != image.shape:
-            full_seg = resize(zout_down, (image.shape[0], image.shape[1]), order=0, 
-                             mode='reflect', anti_aliasing=True, preserve_range=True)
-        else:
-            full_seg = zout_down
-
-
-        # Now we have the full seg, we can write it out to the zarr store
-        # (NOTE: we may want to do the above resizing CHUNKWISE and write directly to ome-zarr store!)
-        # We can call the zout_down store something like 'temp' in the outfile, and delete it later
-
-        ome_zarr.writer.write_image(image=full_seg, scale_factors=scale_factors) 
-
-        for transform in scale_factors:
-            # create the zarr store per transform:
-            zout_prop = _write_empty_chunk(store_path, image, inp_scale=scale, overwrite=False) # inp_scale needs to come from input image zarr store
-
-            # First resize the zout_down array:
-            resized_seg = resize(
-                zout_down, (zout_down.shape[0]*2, zout_down.shape[1]*2), order=0, mode='reflect', 
-                anti_aliasing=True, preserve_range=True)
-        '''
-
-        # Sixth, get the other samplings across the other resolutions in the original too
+        image_store = "https://bioimaging-01-pub.livingobjects.ebi.ac.uk/phase1test/EMPIAR-10311-IM1.zarr"  #The original image's zarr store
+        self.write_out_multiscale(image_store, image, store_path, zout_down)
 
         # Done  
                 
@@ -249,7 +271,7 @@ class SliceInference:
     
         
 
-        print("Done.")
+        print("Segmentation Done.")
         return da.from_zarr(zout_down)
 
 
@@ -273,7 +295,7 @@ class SliceInference:
 
         if zarr_store is not None:
             # Get this chunk's classID:
-            id = slice_idx[0].start + slice_idx[1].stop
+            id = (slice_idx[0].start + slice_idx[1].stop)//100 * 100
             class_id = self.class_ids[id]
             old_divisor = self.maximum_objects_per_class
 
@@ -288,14 +310,13 @@ class SliceInference:
 
 
             if not merge_labels:
-                print("not merging labels")
+                # print("not merging labels")
                 final = seg
         
             else:
                 print("merging labels...")
                 # Merge overlapping labels into same label
                 existing = zarr_store[slice_idx]
-                print("!!!Z", input_array.shape, existing.shape, seg.shape, slice_idx)
 
                 seg2_to_seg1 = self.build_mapping(existing, seg)
                 seg2_fixed = self.apply_mapping(seg, seg2_to_seg1)
@@ -308,14 +329,34 @@ class SliceInference:
             zarr_store[slice_idx] = final
             
             return
-            
         return seg, axis, plane, y, x
 
+    def apply_mapping(self, seg, mapping=None, lut=None, zarr_store=None, slice_idx=None):
 
-    def apply_mapping(self, seg, mapping):
-        out = seg.copy()    
-        for old, new in mapping.items():
-            out[seg == old] = new   
+        print("replacing labels...")
+
+        if lut is None:
+            max_key = max(mapping)
+            lut = np.arange(max_key + 1, dtype=np.int64)
+
+            for old, new in mapping.items():
+                lut[old] = new
+
+        out = lut[seg]
+
+        # print("MAP: ", mapping)
+        # print("Unique seg:", np.unique(seg))
+        # print("OUT>0 LABELS: ", out[out>0])
+        
+        # out = seg.copy()    
+        # for old, new in mapping.items():
+        #     out[seg == old] = new   
+
+        if zarr_store and slice_idx:
+            zarr_store[slice_idx] = out
+            print("exported finalised labels!")
+            return
+        
         return out
 
     def build_mapping(self, seg1, seg2, min_conf=0.8):
@@ -393,6 +434,68 @@ class SliceInference:
         return multiscales, datasets
         
 
+    def write_out_multiscale(self, image_store, image_arr, seg_store, seg_arr):
+        # Load the coordinate transforms from the original dataset:
+        rtgroup = zarr.open_group(image_store, mode="r")
+        multiscales, coord_transforms = self._load_ome_zarr(image_store)
+        axes = multiscales[0]['axes']
+        dim_names = [ax['name'] for ax in axes if ax['name'] in ('y', 'x')]
+        print("?????", axes, dim_names)
+
+        abs_scales = []
+        scale_factors = [dict() for _ in coord_transforms]
+        for idx, ds in enumerate(coord_transforms):
+            axis_scale = ds['coordinateTransformations'][0]['scale']
+            abs_scales.append(axis_scale[-1])
+
+            for dim, scale in zip(dim_names, axis_scale):
+                if dim in ('y', 'x'):
+                    scale_factors[idx][dim] = scale
+
+        # Get datasets attr, correct the scale lengths
+        for dset in coord_transforms:
+            transform = dset["coordinateTransformations"][0]
+            transform["scale"] = transform["scale"][-2:]
+            dset["path"] = f"s{dset['path']}"
+
+        label_axes = []
+        for ax in axes:
+            if ax['name'] in ('y', 'x'):
+                label_axes.append(ax)
+
+        multiscales2 = rtgroup.attrs["multiscales"]
+        coord_transforms2 = multiscales2[0]["datasets"]
+        multidims = []
+        for d in coord_transforms2:
+            path = d["path"]
+            dims = rtgroup[path].shape
+            multidims.append(dims[-2:])
+
+
+        inp_scale = list(scale_factors[0].values())
+
+        scales = np.asarray([_['coordinateTransformations'][0]['scale'] for _ in coord_transforms])
+        scale_factors_raw = np.asarray(scales[1:]/scales[0], dtype="int")
+        scale_factors = [dict(zip(dim_names, pair)) for pair in scale_factors_raw]
+
+
+        # First, upscale the downscaled labels array to the full res shape:
+        # if seg_arr.shape != image_arr.shape:
+        #     full_seg = resize(seg_arr, (image_arr.shape[0], image_arr.shape[1]), order=0, 
+        #                      mode='reflect', anti_aliasing=False, preserve_range=True)
+        # else:
+        #     full_seg = seg_arr
+
+
+        # Now we have the full seg, we can write it out to the zarr store
+        # (NOTE: we may want to do the above resizing CHUNKWISE and write directly to ome-zarr store!)
+        # We can call the zout_down store something like 'tmp' in the outfile, and delete it later
+
+        
+        _write_multiscale(seg_store, seg_arr, scale_factors, multidims, datasets=coord_transforms, axes=label_axes)
+
+        return
+
     # ---------------- Engine management ----------------
     def get_engine(self):
         reload_engine = (
@@ -463,7 +566,7 @@ class SliceInference:
                 # plane = 0
                 plane = 223 # TMP
                 slices[axis] = plane
-                print("TEST DEBUG??", axis, plane, slices)
+                # print("TEST DEBUG??", axis, plane, slices)
 
             else:
                 axis = None
@@ -719,7 +822,6 @@ class SliceInference:
         self.viewer.layers[-1].scale = self.image_layer.scale
 
         self.pbar.hide()
-
 
     def  _store_test_result(self, *args):
         seg, axis, plane, y, x = args[0]
