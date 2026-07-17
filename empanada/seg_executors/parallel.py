@@ -18,7 +18,8 @@ class ParallelExecutor(Executor):
         super().__init__(fill_holes_in_segmentation)
         self.zarr_inpath = zarr_inpath
         self.zarr_outpath = zarr_outpath
-        self.scale=2 # Downsampling scale to use for the full arr
+        self.scale=scale # Downsampling scale to use for the full arr
+        self.padding=200 # Used to compute diameter of the strip arrays
         self.class_ids = {}
 
     def _get_zarr_metadata(self):
@@ -32,7 +33,7 @@ class ParallelExecutor(Executor):
         
         '''Step 1: Compute the downsampled array & 4-panel chunks'''
         image = self._downsample_array(image, self.scale)
-        tile_shape = [dim//2 for dim in image.shape]
+        tile_shape = [dim//self.scale for dim in image.shape]
         chunk_indices = list(_generate_tiles(image.shape, tile_shape))
 
         '''Step 2: Create the initial class IDs'''
@@ -43,12 +44,12 @@ class ParallelExecutor(Executor):
         zout_tmp = _write_empty_chunk(self.zarr_outpath, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
 
         '''Step 4: Run parallel segmentation on the chunks and handle labels'''
-        self.process_segmentation_chunk(engine, image, axis, plane, y, x, 
-                                   zout_tmp, slice_idx=None, 
-                                   merge_labels=False)
+        self.delayed_process_segmentation_chunk(engine, image, chunk_indices,
+                                                axis, plane, y, x, zout_tmp)
+    
         
         '''Step 5: Compute the strips arrays and indices across the panel seams'''
-        strip_arrays = self._get_strips(chunk_sizes, padding=200)
+        strip_arrays = self._get_strips(image.shape, chunk_indices, self.padding)
 
         '''Step 6: Create their class IDs too'''
         self._create_class_ids(strip_arrays)
@@ -73,9 +74,11 @@ class ParallelExecutor(Executor):
         return da.from_zarr(multiscale_arr_path), axis, plane, y, x
     
     # --------- Joblib Delayed Methods ---------
-    def delayed_process_segmentation_chunk(self, engine, image_down, chunk_indices, axis, plane, y, x, zout_down, merge_labels):
+    def delayed_process_segmentation_chunk(self, engine, image_down, chunk_indices, 
+                                           axis, plane, y, x, zout_down, merge_labels=False):
         compute = joblib.delayed(self.process_segmentation_chunk)
-        jobs = [compute(image_down[idx], axis, plane, y, x, zout_down, idx) for idx in chunk_indices]
+        jobs = [compute(engine, image_down[idx], axis, plane, y, x, 
+                        zout_down, idx, merge_labels) for idx in chunk_indices]
         
         for job in jobs: 
             print("Job:", job)
@@ -136,11 +139,51 @@ class ParallelExecutor(Executor):
         for job in jobs: print("Remapping Job:", job)
         executor = joblib.Parallel(n_jobs=-1, backend='threading')
         executor(jobs) 
-        '''Label reconciliation Done!'''
+        
+        print("Label reconciliation Done!")
 
         return
 
-    def _get_strips(self, chunk_sizes:list, padding:int):
+    def _get_strips(self, shape, chunk_sizes: list):
+        """
+        shape: tuple like (H, W, D) or (H, W)
+        chunk_sizes: list of step sizes per axis (same length as shape)
+        padding: thickness around boundaries
+        """
+
+        n_dim = len(shape)
+
+        # build grid edges per axis
+        edges = []
+        for dim, step in enumerate(chunk_sizes):
+            s = shape[dim]
+            e = list(range(0, s, step))
+            if e[-1] != s:
+                e.append(s)
+            edges.append(e)
+
+        strips = {dim: [] for dim in range(n_dim)}
+
+        # for each axis, build boundary strips 
+        for axis in range(n_dim):
+            for boundary in edges[axis][1:-1]:
+
+                slc = []
+                for d in range(n_dim):
+
+                    if d == axis:
+                        # thin strip around boundary
+                        slc.append(slice(
+                            max(0, boundary - self.padding),
+                            min(shape[d], boundary + self.padding)
+                        ))
+                    else:
+                        # full extent in other dims
+                        slc.append(slice(0, shape[d]))
+
+                strips[axis].append(tuple(slc))
+
+        return strips
 
         # This first gets slice objects for horizontal + vertical chunk boundaries
         # We need to know: a list of chunk indices
@@ -166,36 +209,22 @@ class ParallelExecutor(Executor):
         seg, axis, plane, y, x = self._get_segmentation(engine, image, axis, plane, y, x)
 
         # Deal with label updating within zarr_store:
-        # Get this chunk's classID:
-        id = (slice_idx[0].start + slice_idx[1].stop)//100 * 100
-        class_id = self.class_ids[id]
-        old_divisor = self.maximum_objects_per_class
-
-        unique_labels = np.unique(seg[seg>0])
-
-        # Update all labels in seg to be class_id
-        mapping = {
-            old_label: (old_label-old_divisor)+class_id
-            for old_label in unique_labels
-        }
+        mapping = self._create_chunk_labels(slice_idx, self.maximum_objects_per_class, np.unique(seg[seg>0]))
         seg = self.apply_mapping(seg, mapping)
 
         if not merge_labels:
             final = seg
-
-        else:
+        else: # Merge overlapping labels into same label
             print("merging labels...")
-            # Merge overlapping labels into same label
-            existing = zarr_store[slice_idx]
+            final = zarr_store[slice_idx].copy()
 
-            seg2_to_seg1 = self.build_mapping(existing, seg)
+            seg2_to_seg1 = self.build_mapping(zarr_store[slice_idx], seg)
             seg2_fixed = self.apply_mapping(seg, seg2_to_seg1)
 
-            final = existing.copy()
             mask = seg2_fixed > 0
             final[mask] = seg2_fixed[mask]
-            print("Saving...")
-
+            
+        print("Saving...")
         zarr_store[slice_idx] = final
         return
 
@@ -204,24 +233,40 @@ class ParallelExecutor(Executor):
         # This should also take the scale factor/resolution level to downsample to
         return image[::scale, ::scale]
     
-    def _create_class_ids(self, chunk_indices):
-        class_id = 1
-        divisor = 1000
+    def _get_chunk_uid(self, slice_idx):
+        coords = [(s.start if i < len(slice_idx) - 1 else s.stop - 1)
+                for i, s in enumerate(slice_idx)]
+        
+        return "_".join(map(str, coords))
 
-        for idx in chunk_indices:
-            id = (idx[0].start + idx[1].stop)//100 * 100
-            self.class_ids[id] = class_id*divisor
+    def _create_class_ids(self, chunk_indices):
+        divisor = 1000
+        if self.class_ids:
+            class_id = max(self.class_ids.values()) + 1
+        else:
+            class_id = 1
+    
+        for slice_idx in chunk_indices:
+            uid = self._get_chunk_uid(slice_idx)
+            self.class_ids[uid] = class_id*divisor
             class_id += 1
 
         ## Need to handle the dict of vertical + hori strips/indices:
-        for chunk_idx in [v_idx, h_idx]:
-            id = (chunk_idx[0].start + chunk_idx[1].stop)//100 * 100
-            self.class_ids[id] = class_id*divisor
-            class_id += 1
+        # for chunk_idx in [v_idx, h_idx]:
+        #     id = (chunk_idx[0].start + chunk_idx[1].stop)//100 * 100
+        #     self.class_ids[id] = class_id*divisor
+        #     class_id += 1
         
         return
     
 # ----- Label Postprocessing -----
+    def _create_chunk_labels(self, slice_idx, old_divisor, unique_labels):
+        uid = self._get_chunk_uid(slice_idx)
+        class_id = self.class_ids[uid] # ID Prefix for current chunk
+
+        mapping = {old_label: (old_label-old_divisor)+class_id
+                    for old_label in unique_labels}
+        return mapping
 
     def apply_mapping(self, seg, mapping=None, lut=None, zarr_store=None, slice_idx=None):
 

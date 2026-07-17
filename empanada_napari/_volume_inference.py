@@ -18,6 +18,7 @@ from pathlib import Path
 from itertools import product
 from torch.cuda import device_count
 from dask.array.core import slices_from_chunks
+from empanada.seg_executors import SerialExecutor, ParallelExecutor
 from empanada_napari.inference import Engine3d, _tracker_consensus, tracker_consensus, _stack_postprocessing, stack_postprocessing
 from empanada_napari.multigpu import MultiGPUEngine3d
 from empanada_napari.utils import get_configs, abspath
@@ -32,10 +33,9 @@ if torch.backends.quantized.engine in (None or 'none'):
 
 class VolumeInference:
     def __init__(self,
-            image_layer: Image | np.ndarray,
+            image: np.ndarray | da.Array | zarr.array,
             model_config: str,
             multiscale_level: int=0,
-            viewer: Viewer = None,
             label_head: dict = None,
             use_gpu: bool = False,
             use_quantized: bool = False,
@@ -66,12 +66,11 @@ class VolumeInference:
             store_dir: str = None,
             chunk_size: int|list[int] = 256,
 
-            pbar: widgets.ProgressBar = None
+            
     ):
         
-        self.viewer = viewer
+        self.image = image
         self.label_head = label_head
-        self.image_layer = image_layer
         self.multiscale_level = multiscale_level
         self.model_config_name = model_config
         self.use_gpu = use_gpu
@@ -112,105 +111,42 @@ class VolumeInference:
             self.chunk_size = tuple(int(s) for s in chunk_size)
 
         self._check_option_compatibility()
-        self.pbar = pbar
 
 
     # ---------------- Option handling & inference running entrypoint ----------------
-    def config_and_run_inference(self):
-        # Load the model config
+    def config_and_run_inference(self, zarr_inpath=None, zarr_outpath=None):
+        '''Step 1: Load the model config'''
         model_configs = get_configs()
         self.model_config = read_yaml(model_configs[self.model_config_name])
 
         if self.last_config is None:
             self.last_config = self.model_config_name
 
-        # Create storage url from layer name and model config
+        '''Step 2: Create storage url from layer name and model config'''
         if not self.use_store_dir: # This is a default -
             self.store_url = None
             print(f'Running without zarr storage directory, this may use a lot of memory!')
         else:
+            # Consider using this url for both: regular Zarr output & OME-Zarr output
             self.store_url = os.path.join(self.store_dir, f'{self.image_layer.name}_{self.model_config_name}.zarr')
 
+        '''Step 3: Setup the Engine'''
         self.get_engine()
 
-        image = self._get_image_as_array()
+        '''Step 4: Get the 3d slice from the image'''
+        image = self._get_image_as_array(self.image)
+        print(image.shape, self.image.shape)
 
-        # image will be a da.Array (lazy loaded)
-        # 1. Create the delayed version of the function: delayed_infer = joblib.delayed(infer)
-        # 2. Create a list of jobs from the chunks: jobs = [delayed_infer(chunk[i]) for i in chunks]
-        # 3. Run the jobs using: executor(jobs)
+        '''Step 5: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
+        if type(image) == da.Array and zarr_inpath and zarr_outpath:
+            scale=2
+            executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes, self.orthoplane)
+        else:
+            executor = SerialExecutor(self.fill_holes, self.orthoplane)
 
-
-        # When we have a dask/zarr file, we will iterate over each chunk
-        # Load the chunk into memory
-        # Call either the orthoplane or volume segmentation methods on it (Future issues with consensus on ortho can be dealt with later)
-        # Write out the mask/result[0][0] to the output chunk
-        # 
-        # Later: Figure out how to use the built-in writing to the chunk 
-        if type(image) == da.core.Array:
-            # If loaded dask array, write the empty output zarr array to disk
-            zout = _write_empty_chunk(image)
-
-            # mapped_data = da.map_blocks(my_function, data) equiv to below
-            # stack = image.map_blocks(self._determine_inference)
-
-            # Write stack to chunk it came from
-
-            # First lets create the jobs
-            # We need a list of all the chunk indices:
-            chunk_indices = list(slices_from_chunks(image.chunks)) # may not need to be a list
-            #Q: does this produce the same thing as np.ndindex(image.numblocks)?
-
-            # Second, for each index, lets pass (image[index], index) to our delayed_inference wrapper function
-            # This will create each function call (i.e. inference(image[0:10], index=10)), but won't run them yet
-            delayed_run_segmentation = joblib.delayed(self.run_segmentation)
-            jobs = [delayed_run_segmentation(image[idx], zout, idx) for idx in chunk_indices]
-            
-            if len(jobs)>1:
-                jobs = jobs[:1]
-    
-            for job in jobs:
-                print("Job:", job)
-    
-            executor = joblib.Parallel(n_jobs=1, backend='threading')
-            executor(jobs)
-
-            print("Done.")
-            return da.from_zarr(zout)
-
-            # Within the wrapper, its behaviour should be:
-                # Take the array chunk
-                # Figure out whatever inference it's meant to call
-                # Call it on that array chunk
-                # Set zout[index] = result
-                
-
-            # for idx in np.ndindex(image.numblocks):
-                
-
-
-            #     chunk = image.blocks[idx].compute()
-                
-            #     if chunk.dtype != np.uint8:
-            #         chunk = chunk.astype(np.uint8)
-            #     print("WORKING ON CHUNK:", idx, chunk.shape, chunk.dtype)
-
-            #     result = self._stack_inference(self.engine, chunk, self.inference_plane)
-            #     result = self.start_postprocess_worker(result)
-
-            #     slices = tuple(
-            #                 slice(sum(image.chunks[dim][:i]), sum(image.chunks[dim][:i+1]))
-            #                 for dim, i in enumerate(idx)
-            #             )
-                
-            #     print("DEBUG", idx, slices, len(result), result[0][0])
-            #     print("DEBUG2", zout[slices].shape, result[0][0].shape)
-                
-            #     zout[slices] = result[0][0]
-
-            #     print("Done.")
-            #     return
-
+        '''Step 6: Return the computed segmentation array'''
+        result = executor.run_workflow(self.engine, image, plane=self.inference_plane)
+        return result
    
 
     def run_segmentation(self, input_array, zarr_store, slice_idx):
@@ -317,19 +253,8 @@ class VolumeInference:
             )
         return
     
-    def _get_image_as_array(self):
-        # Get the 3d slice from the image (Can mock a layer/viewer object in the tests)
-        if type(self.image_layer) is Image:
-            image = self.image_layer.data
-            if self.image_layer.multiscale:
-                print(f'Multiscale image selected, using resolution level {self.multiscale_level}!')
-                try:
-                    if self.multiscale_level <= len(image):
-                        image = image[self.multiscale_level]
-                except IndexError:
-                    raise Exception(f'Maximum multiscale level is {len(image) - 1}, got multiscale level {self.multiscale_level}')
-        else:
-            image = self.image_layer
+    def _get_image_as_array(self, image):
+        # Get the 3d slice from the image 
 
         # Verify that the image doesn't have extraneous channel dimensions
         assert image.ndim in [3, 4], "Only 3D and 4D input images can be handled!"
@@ -394,10 +319,10 @@ class VolumeInference:
 
 class VolumeInferenceWidget(VolumeInference):
     def __init__(self,
-            image_layer: Image | np.ndarray,
-            model_config: str,
-            multiscale_level: int=0,
+            image_layer: Image,
             viewer: Viewer = None,
+            model_config: str = None,
+            multiscale_level: int=0,
             label_head: dict = None,
             use_gpu: bool = False,
             use_quantized: bool = False,
@@ -430,40 +355,18 @@ class VolumeInferenceWidget(VolumeInference):
 
             pbar: widgets.ProgressBar = None
     ):
+        super().__init__(image_layer.data, model_config, multiscale_level, label_head,
+        use_gpu, use_quantized, multigpu, downsampling, confidence_thr, 
+        center_confidence_thr, min_distance_object_centers, fine_boundaries, 
+        semantic_only, median_slices, min_size, min_extent,
+        maximum_objects_per_class, inference_plane, label_erosion,
+        label_dilation, fill_holes_in_segmentation, orthoplane,
+        return_panoptic, pixel_vote_thr, allow_one_view,
+        use_store_dir, store_dir, chunk_size)
+
+        self.image_layer = image_layer
         self.viewer = viewer
         self.label_head = label_head
-        self.image_layer = image_layer
-        self.multiscale_level = multiscale_level
-        self.model_config_name = model_config
-        self.use_gpu = use_gpu
-        self.use_quantized = use_quantized
-        self.multigpu = multigpu
-
-        self.downsampling = downsampling
-        self.confidence_thr = confidence_thr
-        self.center_confidence_thr = center_confidence_thr
-        self.min_distance_object_centers = min_distance_object_centers
-        self.fine_boundaries = fine_boundaries
-        self.semantic_only = semantic_only
-
-        self.median_slices = median_slices
-        self.min_size = min_size
-        self.min_extent = min_extent
-        self.maximum_objects_per_class = int(maximum_objects_per_class)
-        self.inference_plane = inference_plane
-
-        self.label_erosion = label_erosion
-        self.label_dilation = label_dilation
-        self.fill_holes = fill_holes_in_segmentation
-        self.orthoplane = orthoplane
-        self.return_panoptic = return_panoptic
-        self.pixel_vote_thr = pixel_vote_thr
-        self.allow_one_view = allow_one_view
-
-        self.use_store_dir = use_store_dir
-        self.store_dir = str(store_dir)
-        self.last_config = None
-        self.engine = None
 
         if type(chunk_size) == int: chunk_size = [chunk_size]
         if len(chunk_size) == 1:
@@ -476,37 +379,39 @@ class VolumeInferenceWidget(VolumeInference):
         self.pbar = pbar
 
 # ---------------- Option handling & inference running entrypoint ----------------
-    def config_and_run_inference(self):
-        # Load the model config
+    def config_and_run_inference(self, zarr_inpath=None, zarr_outpath=None):
+        '''Step 1: Load the model config'''
         model_configs = get_configs()
         self.model_config = read_yaml(model_configs[self.model_config_name])
 
         if self.last_config is None:
             self.last_config = self.model_config_name
 
-        # Create storage url from layer name and model config
+        '''Step 2: Create storage url from layer name and model config'''
         if not self.use_store_dir: # This is a default -
             self.store_url = None
             print(f'Running without zarr storage directory, this may use a lot of memory!')
         else:
+            # Consider using this url for both: regular Zarr output & OME-Zarr output
             self.store_url = os.path.join(self.store_dir, f'{self.image_layer.name}_{self.model_config_name}.zarr')
 
+        '''Step 3: Setup the Engine'''
         self.get_engine()
 
-        # Get the 3d slice from the image (Can mock a layer/viewer object in the tests)
-        image = self._get_image_as_array()
+        '''Step 4: Get the 3d slice from the image'''
+        image = self._get_image_as_array(self.image)
+        print(image.shape, self.image.shape)
 
-        # if self.orthoplane:
-        #     worker = self.orthoplane_inference(self.engine, image)
-        #     worker.returned.connect(self.start_consensus_worker)
-        #     worker.start()
+        '''Step 5: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
+        if type(image) == da.Array and zarr_inpath and zarr_outpath:
+            scale=2
+            executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes, self.orthoplane)
+        else:
+            executor = SerialExecutor(self.fill_holes, self.orthoplane)
 
-        # else:
-        #     worker = self.stack_inference(self.engine, image, self.inference_plane)
-        #     worker.returned.connect(self._new_segmentation)
-        #     worker.returned.connect(self.start_postprocess_worker)
-        #     worker.start()
-        
+        '''Step 6: Return the computed segmentation array'''
+        result = executor.run_workflow(self.engine, image, plane=self.inference_plane)
+        return result
 
 
         if type(image) == da.core.Array:
@@ -568,6 +473,34 @@ class VolumeInferenceWidget(VolumeInference):
                 # return
 
         return
+    
+    def _get_image_as_array(self, image):
+        # Get the 3d slice from the image (Can mock a layer/viewer object in the tests)
+        if self.image_layer.multiscale:
+            print(f'Multiscale image selected, using resolution level {self.multiscale_level}!')
+            try:
+                if self.multiscale_level <= len(image):
+                    image = image[self.multiscale_level]
+            except IndexError:
+                raise Exception(f'Maximum multiscale level is {len(image) - 1}, got multiscale level {self.multiscale_level}')
+      
+
+        # Verify that the image doesn't have extraneous channel dimensions
+        assert image.ndim in [3, 4], "Only 3D and 4D input images can be handled!"
+        if image.ndim == 4:
+            # Channel dimensions are commonly 1, 3 and 4
+            # Check for dimensions on zeroth and last axes
+            shape = image.shape
+            if shape[0] in [1, 3, 4]:
+                image = image[0]
+            elif shape[-1] in [1, 3, 4]:
+                image = image[..., 0]
+            else:
+                raise Exception(f'Image volume must be 3D, got image of shape {shape}')
+
+            print(f'Got 4D image of shape {shape}, extracted single channel of size {image.shape}')
+
+        return image
 
 
 # ---------------- Napari Helper methods ----------------

@@ -9,9 +9,11 @@ import numpy as np
 
 class Executor(ABC):
     def __init__(self,
-                 fill_holes_in_segmentation=False
+                 fill_holes_in_segmentation=False,
+                 orthoplane=False
                  ):
         self.fill_holes = fill_holes_in_segmentation
+        self.orthoplane = orthoplane
 
     @abstractmethod
     def run_workflow(self):
@@ -19,6 +21,17 @@ class Executor(ABC):
     
     # ---------------- Inference runners ----------------
     def _get_segmentation(self, engine, image=None, axis=None, plane=None, y=None, x=None):
+        # To Do: Decide what to do here, do we process 'result' into also returning seg, axis, etc.?
+        
+        if image.ndims == 2:
+            seg, axis, plane, y, x = self._get_segmentation_2d(engine, image, axis, plane, y, x)
+            return seg, axis, plane, y, x
+
+        elif image.ndims == 3 or image.ndims == 4: #?
+            result = self._get_segmentation_3d(engine, image, plane)
+            return result 
+
+    def _get_segmentation_2d(self, engine, image=None, plane=None):
         
         if self.batch_mode:
             seg, axis, plane, y, x = self._run_model_batch(engine, image, self.fill_holes)
@@ -26,7 +39,18 @@ class Executor(ABC):
             seg, axis, plane, y, x = self._run_model(engine, image, axis, plane, y, x, self.fill_holes)
 
         return seg, axis, plane, y, x
+    
 
+    def _get_segmentation_3d(self, engine, image=None, plane=None):
+        # This part needs super refactoring
+        if self.orthoplane:
+            result = self._orthoplane_inference(engine, image)
+        else:
+            result = self._stack_inference(engine, image, plane)
+
+        return result
+
+    # ---------------- 2D ----------------
     @thread_worker
     def run_model(self, engine, image, axis, plane, y, x, fill_holes):
         return self._run_model(engine, image, axis, plane, y, x, fill_holes)
@@ -84,6 +108,35 @@ class Executor(ABC):
         else:
             raise Exception(f'Batch mode supports 2d and 3d, got {image.ndim}d.')
 
+    # ---------------- 3D ----------------
+
+    @thread_worker
+    def stack_inference(self, engine, volume, axis_name):
+        return self._stack_inference(engine, volume, axis_name)
+
+    @thread_worker
+    def orthoplane_inference(self, engine, volume):
+        return self._orthoplane_inference(engine, volume)
+
+    def _stack_inference(self, engine, volume, axis_name):
+        stack, trackers = engine.infer_on_axis(volume, axis_name)
+        trackers_dict = {axis_name: trackers}
+        return stack, axis_name, trackers_dict
+
+    def _orthoplane_inference(self, engine, volume):
+        trackers_dict = {}
+        axes_dict = {}
+        axes_dict = {}
+        for axis_name in ['xy', 'xz', 'yz']:
+            stack, trackers = engine.infer_on_axis(volume, axis_name)
+            trackers_dict[axis_name] = trackers
+            
+            # report instances per class
+            for tracker in trackers:
+                class_id = tracker.class_id
+                print(f'Class {class_id}, axis {axis_name}, has {len(tracker.instances.keys())} instances')
+            axes_dict[axis_name] = stack
+        return trackers_dict, axes_dict
 
     # ---------------- Helper methods ----------------    
     def _fill_holes_in_segmentation(self, mask):

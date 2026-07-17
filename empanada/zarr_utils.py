@@ -1,21 +1,12 @@
 import math
-import dask
-import joblib
 import zarr
 import numba
-import itertools
-
-import itertools
-
 import numpy as np
-import numpy.typing as npt
-import dask.array as da
 
-from joblib import delayed
 from multiprocessing import Pool
-from typing import Any, Callable, Generator
-from typing import Any, Callable, Generator
-from empanada.array_utils import put, rle_to_ranges, ranges_to_rle
+from skimage.transform import resize
+from ome_zarr.writer import write_multiscale, write_multiscales_metadata
+from empanada.array_utils import rle_to_ranges
 
 __all__ = [
     'zarr_fill_instances'
@@ -189,89 +180,28 @@ def zarr_fill_instances(array, instances, processes=4):
 
 
 
-#### Helper Functions I Added ####
+# ---------------- OME-Zarr Helper Functions ----------------
 
-### 1: Generate Array Indices of each chunk
-# Input is the dask array that napari layer uses/converts to when opening a .zarr file
+def _generate_tiles(shape, tile_shape):
+    '''Generates Slice indices for each chunk, given a tuple of chunk(or tile)_shapes'''
 
-def all_chunk_indices(array: da.Array) -> Generator[tuple[slice, ...], None, None]:
-    """
-    Generate indices that represent all chunks in a Zarr (Dask) Array.
-    """
-    ndim = len(array.shape)
-    print("DEBUGGING", ndim, range(ndim), array.shape, array.chunks)
-    indices = [range(0, array.shape[i], array.chunks[i]) for i in range(ndim)]
-    chunk_corners = itertools.product(*indices)
-    yield from (
-        tuple(
-            slice(corner[i], min(corner[i] + array.chunks[i], array.shape[i]))
-            for i in range(ndim)
+    grids = [range(0, s, t) for s, t in zip(shape, tile_shape)]
+
+    for coords in np.ndindex(*[len(g) for g in grids]):
+        yield tuple(
+            slice(grids[d][coords[d]],
+                  min(grids[d][coords[d]] + tile_shape[d], shape[d]))
+            for d in range(len(shape))
         )
-        for corner in chunk_corners
-    )
 
+def _write_empty_chunk(store_path, image, inp_scale=None, inp_units=None):
+    '''Write a single empty array to OME-Zarr
+        Returns: da.array|zarr.array '''
+    # To-Do: Minimum metadata needed is datasets and axes dicts
+    # Make these parameters, use defaults if none given
+    # Rename to _write_empty_label_array (NOT writing chunk)
+    # Input params should be: desired shape, desired chunk sizes, axes, datasets & name
 
-#### In code - convert the dask array into a np array (involves loading it into memory)
-
-### 2: Copy the chunk of data from input arr to output arr & apply func to it
-# Callable[[int], str] e.g. = func that takes a single int param and returns a str
-def apply_to_chunk(
-    f: Callable[[npt.NDArray[Any]], npt.NDArray[Any]],
-    input_array: da.Array,
-    output_array: np.ndarray,
-    chunk_index: slice,
-) -> None:
-    
-    # Callable in this example takes an NDArray and returns an NDArray
-    # We want to convert the da array to a np array
-    """
-    Copy a specific chunk of data from one array to another, applying a function in between.
-
-    Parameters
-    ----------
-    f :
-        Function to apply to slice of data.
-    input_array :
-        Array to read from.
-    output_array :
-        Array to write to.
-    chunk_index :
-        Array slice of data to process.
-    """
-    print(f"Reading index {chunk_index}...")
-    chunk = input_array[chunk_index]
-    chunk = f(chunk)
-    print(f"Writing index {chunk_index}...")
-    output_array[chunk_index] = chunk
-
-    # orthoplane takes an engine and an array
-    # Stack takes engine, array and inference plane (str)
-    # Callables cant have varying args
-    # Solution: Make new func that checks what type of inference to use -
-        # inferring(img_array):
-            # if x, orthoplane(self.engine, vol)
-            # if y, slice(self.engine, vol, self.axis)
-    # should return the output chunk-modified
-    # when all are complete: consensus is computed on the z slices? (ortho)
-    # Can try to paralellise that, and write out the chunks to new/outzarr
-    # Finally, load in outzarr as napari layer (for consensus, and 3 axes) to view
-
-
-#### 3: Write out np.arr to (ome.zarr) chunk
-##### Serial Processing:
-# We have the dask array, iterate over chunks in the array
-# def _iter_zarr_chunks(f: Callable[[npt.NDArray[Any]], npt.NDArray[Any]], array: da.Array) -> None:
-#     mapped_data = da.map_blocks(f, array)
-#     return
-
-import ome_zarr.writer
-import ome_zarr.io
-import ome_zarr_models
-
-
-def _write_empty_chunk(store_path, image, level=1, inp_scale=None, inp_units=None, overwrite=True):
-    # TO-DO: If overwrite=False, don't recreate the root
-    
     ndims = image.ndim
     dim_names = ["z", "y", "x"][-1*ndims:]
     if inp_scale is None:
@@ -282,7 +212,7 @@ def _write_empty_chunk(store_path, image, level=1, inp_scale=None, inp_units=Non
         inp_units = [str(u) for u in inp_units]
         inp_scale = list(inp_scale)
 
-    name = "tmp"
+    group_name = "tmp"
     array_name = "s0"
 
     datasets=[
@@ -294,11 +224,11 @@ def _write_empty_chunk(store_path, image, level=1, inp_scale=None, inp_units=Non
 
     root = zarr.open_group(store_path, mode="w", zarr_format=3)
     
-    root.attrs["labels"] = [name]
+    root.attrs["labels"] = [group_name]
     labels_root = root.require_group("labels")
-    label_group = labels_root.require_group(name)
+    label_group = labels_root.require_group(group_name)
 
-    ome_zarr.writer.write_multiscales_metadata(
+    write_multiscales_metadata(
         label_group,
         datasets=datasets,
         axes=axes,
@@ -316,61 +246,46 @@ def _write_empty_chunk(store_path, image, level=1, inp_scale=None, inp_units=Non
                     dimension_names=dim_names,
                     )
 
-    print(f"Initial empty array written at: {store_path}/labels/{name}/{array_name}")
+    print(f"Initial empty labels array written at: {store_path}/labels/{group_name}/{array_name}")
     return z1
 
 
-def _write_multiscale(store_path, full_seg, scale_factors, multidims, datasets, axes):
-    ndims = full_seg.ndim
+def _write_multiscale(store_path, full_seg, scale_factors, multidims, datasets, axes, name="labels"):
+    # Rename to _write_label_multiscale
 
     root = zarr.open_group(store_path, mode="a", zarr_format=3)
     seg_group = root.require_group("labels/seg")
-
-    # ome_zarr.writer.write_label_metadata()
     
-    print("####WRITING METADATA:", scale_factors, "\n", axes, "\n", datasets)
+    print("WRITING METADATA:", scale_factors, "\n", axes, "\n", datasets)
 
-    write_label_pyramid_from_image(labels=full_seg, group=seg_group, 
-                                   scale_factors=scale_factors, multidims=multidims, axes=axes) 
+    write_label_pyramid_from_image(full_seg, seg_group, 
+                                   scale_factors, multidims, axes, datasets, name) 
     
 
-    ome_zarr.writer.write_multiscales_metadata(group=seg_group, datasets=datasets, 
-                                                axes=axes, name="labels")
-    
-    ome = dict(seg_group.attrs.get("ome", {}))
-    ome["image-label"] = {"version": "0.5"}
-    seg_group.attrs["ome"] = ome
+    # write_multiscales_metadata(group=seg_group, datasets=datasets, 
+                                                # axes=axes, name="labels")
     
     return
 
-from skimage.transform import resize
-from ome_zarr.writer import write_multiscale
 
-def write_label_pyramid_from_image(labels, group, scale_factors, multidims, axes):
+def write_label_pyramid_from_image(labels, group, scale_factors, multidims, axes, coordinate_transformations, name):
     # 1. take scale factors, use to get the array dir names
     path_nms = list(range(len(scale_factors)+1))
 
     # 2. Iterate over the target shapes:
     pyramid = []
-    for dims in multidims:
+    for dims in multidims: # Create pyramid of dask Arrays
         scaled_arr = resize(labels, dims, order=0, 
                         mode='reflect', anti_aliasing=False, preserve_range=True)
         pyramid.append(scaled_arr)
         
-    # Write the downscaled array out
-    write_multiscale(
-        pyramid=pyramid,
-        group=group,
-        axes=axes      
-    )
+    # Write out the pyramid to the /labels/seg group
+    write_multiscale(pyramid, group, axes, coordinate_transformations, name)
 
+    # Add "image-label" key to "ome"
+    ome = dict(group.attrs.get("ome", {}))
+    ome["image-label"] = {"version": "0.5"}
+    group.attrs["ome"] = ome
 
-def _generate_tiles(shape, tile_shape):
-    grids = [range(0, s, t) for s, t in zip(shape, tile_shape)]
+    return
 
-    for coords in np.ndindex(*[len(g) for g in grids]):
-        yield tuple(
-            slice(grids[d][coords[d]],
-                  min(grids[d][coords[d]] + tile_shape[d], shape[d]))
-            for d in range(len(shape))
-        )

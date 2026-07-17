@@ -18,7 +18,6 @@ from empanada_napari.utils import get_configs, abspath
 
 from napari import Viewer
 from napari.layers import Image, Labels, Shapes
-import dask.array as da
 from time import time
 from tqdm import tqdm
 from skimage.draw import polygon
@@ -52,7 +51,7 @@ if engine in (None or 'none'):
 
 class SliceInference:
     def __init__(self, 
-            image_layer: Image,
+            image_layer: np.ndarray | da.Array | zarr.array,
             model_config: str,
             viewer: Viewer = None,
             label_head: dict = None,
@@ -116,7 +115,7 @@ class SliceInference:
         print(image.shape, self.image_layer.shape)
 
         '''Step 4: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
-        if type(image) == da.core.Array and zarr_inpath and zarr_outpath:
+        if type(image) == da.Array and zarr_inpath and zarr_outpath:
             scale=2
             executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes)
         else:
@@ -520,7 +519,6 @@ class SliceInference:
                 # plane = 0
                 plane = 223 # TMP
                 slices[axis] = plane
-                # print("TEST DEBUG??", axis, plane, slices)
 
             else:
                 axis = None
@@ -561,7 +559,16 @@ class SliceInference:
         return
 
 
-    # Stuff for GUI Ver:
+
+
+
+class SliceInferenceWidget(SliceInference):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+    # ---------------- GUI Input Management ----------------
+
     def _viewer_slices(self, image_layer, plane=None, axis=None):
         corners = image_layer.corner_pixels.T.tolist()
         if isinstance(axis, tuple) and isinstance(plane, tuple):
@@ -665,13 +672,6 @@ class SliceInference:
         mask = self._get_mask_from_roi(image_layer, shapes_layer)
         return roi, min_y, min_x, max_y, max_x, mask[min_y:max_y, min_x:max_x]
     
-
-
-
-class SliceInferenceWidget(SliceInference):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
 
 
 
