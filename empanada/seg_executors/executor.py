@@ -22,14 +22,14 @@ class Executor(ABC):
     # ---------------- Inference runners ----------------
     def _get_segmentation(self, engine, image=None, axis=None, plane=None, y=None, x=None):
         # To Do: Decide what to do here, do we process 'result' into also returning seg, axis, etc.?
-        
-        if image.ndims == 2:
+
+        if image.ndim == 2:
             seg, axis, plane, y, x = self._get_segmentation_2d(engine, image, axis, plane, y, x)
             return seg, axis, plane, y, x
 
-        elif image.ndims == 3 or image.ndims == 4: #?
+        elif image.ndim == 3 or image.ndim == 4: #?
             result = self._get_segmentation_3d(engine, image, plane)
-            return result 
+            return result
 
     def _get_segmentation_2d(self, engine, image=None, plane=None):
         
@@ -138,8 +138,22 @@ class Executor(ABC):
             axes_dict[axis_name] = stack
         return trackers_dict, axes_dict
 
-    # ---------------- Helper methods ----------------    
+    # ---------------- Helper methods ----------------
     def _fill_holes_in_segmentation(self, mask):
+        # This lives on the shared Executor base class, but only the 2D
+        # (dense-array) codepaths above ever call it. skimage.measure.regionprops
+        # requires a dense labeled array, which tracker-based 3D subclasses
+        # (stack/orthoplane inference) never produce here -- calling this on
+        # tracker output would fail confusingly rather than at this clear
+        # boundary. Asserting ndim==2 turns a future accidental 3D call into
+        # a loud, immediate error instead of a silent one deep inside
+        # regionprops. The real fix is architectural (move this method off
+        # the shared base class entirely, onto the array-only strategy) --
+        # see report-2026-07-16-segmentation-architecture.md.
+        assert mask.ndim == 2, (
+            f'_fill_holes_in_segmentation only supports 2D dense label arrays, got {mask.ndim}D. '
+            'This method is only valid for array-based (2D) segmentation results.'
+        )
         unique_indices = np.unique(mask)
         rprops = measure.regionprops(mask)
 
