@@ -5,6 +5,7 @@ import dask.array as da
 from tqdm import tqdm
 
 from .result import ArrayResult, TrackerResult
+from .reconciler import ArrayChunkReconciler, TrackerChunkReconciler
 
 
 class InferenceStrategy(ABC):
@@ -28,10 +29,8 @@ class InferenceStrategy(ABC):
     """
 
     #: ChunkReconciler subclass to use when this strategy is run inside
-    #: a ChunkedExecutor. Wired up once ChunkReconciler exists (see
-    #: report-2026-07-15-orthoplane-strategy.md and the follow-up
-    #: architecture report); left as None here as a placeholder so this
-    #: branch is importable and testable on its own.
+    #: a ChunkedExecutor. None means this strategy can only ever run
+    #: inside a SingleRegionExecutor.
     reconciler_cls = None
 
     def __init__(self, fill_holes_in_segmentation=False):
@@ -78,7 +77,11 @@ class InferenceStrategy(ABC):
 
 class SingleSliceStrategy(InferenceStrategy):
     r"""2D, non-batch: engine.infer() on one image, dense array output.
-    Moved near-unchanged from Executor._run_model."""
+    Moved near-unchanged from Executor._run_model. This is the strategy
+    the zarr_2dinference_implement branch's chunked (panel + boundary
+    strip) 2D workflow is built around, hence ArrayChunkReconciler."""
+
+    reconciler_cls = ArrayChunkReconciler
 
     def run(self, engine, image, axis=None, plane=None, y=None, x=None, **kwargs):
         seg = engine.infer(image)
@@ -138,6 +141,8 @@ class StackStrategy(InferenceStrategy):
     output for exactly that axis. Moved near-unchanged from
     Executor._stack_inference."""
 
+    reconciler_cls = TrackerChunkReconciler
+
     def run(self, engine, volume, axis_name='xy', **kwargs):
         stack, trackers = engine.infer_on_axis(volume, axis_name)
         return TrackerResult({axis_name: trackers}, {axis_name: stack})
@@ -153,6 +158,8 @@ class OrthoplaneStrategy(InferenceStrategy):
     exactly what makes this the one strategy whose finalize() isn't the
     default identity.
     """
+
+    reconciler_cls = TrackerChunkReconciler
 
     def run(self, engine, volume, **kwargs):
         trackers_dict = {}

@@ -9,6 +9,8 @@ from .strategy import (
     OrthoplaneStrategy,
 )
 from .result import SegmentationResult, ArrayResult, TrackerResult
+from .reconciler import ChunkReconciler, ArrayChunkReconciler, TrackerChunkReconciler
+from .union_find import UnionFind
 
 __all__ = [
     'Executor',
@@ -22,4 +24,8 @@ __all__ = [
     'SegmentationResult',
     'ArrayResult',
     'TrackerResult',
+    'ChunkReconciler',
+    'ArrayChunkReconciler',
+    'TrackerChunkReconciler',
+    'UnionFind',
 ]
