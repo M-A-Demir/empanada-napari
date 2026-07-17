@@ -4,8 +4,8 @@ import pytest
 from tifffile import imread
 from napari.components import ViewerModel
 from empanada_napari.utils import get_configs
-from empanada_napari._slice_inference import SliceInferenceWidget
-from empanada_napari._volume_inference import VolumeInferenceWidget
+from empanada_napari._slice_inference import SliceSegPipeline
+from empanada_napari._volume_inference import VolumeSegPipeline
 
 from .conftest import MODEL_NAMES, gen_slice_dset_params, gen_vol_dset_params, gen_ortho_dset_params
 pytestmark = pytest.mark.benchmark()
@@ -45,11 +45,11 @@ class TestSliceInference:
     def test_slice_inference_benchmark(self, tutorial_2d_image, test_args, expected_labels, benchmark):
         viewer = ViewerModel()
         image_layer = viewer.add_image(tutorial_2d_image)
-        inference_config = SliceInferenceWidget(viewer=viewer,
+        inference_config = SliceSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         use_gpu=True,
                                         **test_args)
-        benchmark(inference_config.config_and_run_inference, use_thread=False)
+        benchmark(inference_config.config_and_run_inference)
 
 class TestVolumeInference:
     @pytest.mark.parametrize(("test_args", "expected_labels"), gen_vol_dset_params(),
@@ -58,13 +58,13 @@ class TestVolumeInference:
         viewer = ViewerModel()
         image_layer = viewer.add_image(tutorial_3d_image)
         inference_plane = 'xy'
-        inference_config = VolumeInferenceWidget(viewer=viewer,
+        inference_config = VolumeSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         return_panoptic=True,
                                         use_gpu=True,
                                         inference_plane=inference_plane,
                                         **test_args)
-        benchmark(inference_config.config_and_run_inference, use_thread=False)
+        benchmark(inference_config.config_and_run_inference)
 
 
     @pytest.mark.parametrize(("test_args", "expected_labels"), gen_ortho_dset_params(),
@@ -72,10 +72,10 @@ class TestVolumeInference:
     def test_volume_orthoplane_inference_benchmark(self, tutorial_3d_image, test_args, expected_labels, benchmark):
         viewer = ViewerModel()
         image_layer = viewer.add_image(tutorial_3d_image)
-        inference_config = VolumeInferenceWidget(viewer=viewer,
+        inference_config = VolumeSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         use_gpu=True,
                                         return_panoptic=True,
                                         orthoplane=True,
                                         **test_args)
-        benchmark(inference_config.config_and_run_inference, use_thread=False)
+        benchmark(inference_config.config_and_run_inference)

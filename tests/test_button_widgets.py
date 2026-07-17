@@ -7,8 +7,8 @@ import numpy as np
 from tifffile import imread
 import tifffile
 from napari.components import ViewerModel
-from empanada_napari._slice_inference import SliceInferenceWidget
-from empanada_napari._volume_inference import VolumeInferenceWidget
+from empanada_napari._slice_inference import SliceSegPipeline
+from empanada_napari._volume_inference import VolumeSegPipeline
 from empanada_napari.utils import get_configs
 
 from .conftest import MODEL_NAMES, gen_slice_sanity_params, gen_slice_dset_params, \
@@ -80,10 +80,10 @@ class TestSliceInference:
             triangle = np.array([[11, 13], [30, 6], [30, 20]])
             viewer.add_shapes(triangle, shape_type="polygon", edge_width=5)
 
-        inference_config = SliceInferenceWidget(viewer=viewer,
+        inference_config = SliceSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         **test_args)
-        seg, _, _, _, _ = inference_config.config_and_run_inference(use_thread=False)
+        seg, _, _, _, _ = inference_config.config_and_run_inference()
 
         assert isinstance(seg, np.ndarray)
         assert np.asarray(seg).shape == expected_shape
@@ -96,11 +96,11 @@ class TestSliceInference:
         viewer = ViewerModel()
         image_layer = viewer.add_image(tutorial_2d_image)
 
-        inference_config = SliceInferenceWidget(viewer=viewer,
+        inference_config = SliceSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         use_gpu=True,
                                         **test_args)
-        seg, _, _, _, _ = inference_config.config_and_run_inference(use_thread=False)
+        seg, _, _, _, _ = inference_config.config_and_run_inference()
         seg_nonzero = seg[seg != 0]
         counts, _ = np.histogram(seg_nonzero, bins=10)
 
@@ -163,13 +163,13 @@ class TestVolumeInference:
         if "model_config" not in test_args.keys():
             test_args["model_config"] = MODEL_NAMES['MitoNet_mini']
 
-        inference_config = VolumeInferenceWidget(viewer=viewer,
+        inference_config = VolumeSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         return_panoptic=True,
                                         inference_plane=inference_plane,
                                         **test_args)
         
-        stack, axis_name, trackers_dict = inference_config.config_and_run_inference(use_thread=False)
+        stack, axis_name, trackers_dict = inference_config.config_and_run_inference()
         assert isinstance(stack, np.ndarray)
         assert stack.shape == expected_shape
 
@@ -182,14 +182,14 @@ class TestVolumeInference:
         image_layer = viewer.add_image(tutorial_3d_image)
         # inference_plane = "xy"
 
-        inference_config = VolumeInferenceWidget(viewer=viewer,
+        inference_config = VolumeSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         return_panoptic=True,
                                         use_gpu=True,
                                         # inference_plane=inference_plane,
                                         **test_args)
         
-        stack, axis_name, trackers_dict = inference_config.config_and_run_inference(use_thread=False)
+        stack, axis_name, trackers_dict = inference_config.config_and_run_inference()
         seg_nonzero = stack[stack != 0]
         counts, _ = np.histogram(seg_nonzero, bins=10)
 
@@ -209,13 +209,13 @@ class TestVolumeInference:
         if "model_config" not in test_args.keys():
             test_args["model_config"] = MODEL_NAMES['MitoNet_mini']
 
-        inference_config = VolumeInferenceWidget(viewer=viewer,
+        inference_config = VolumeSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         return_panoptic=True,
                                         orthoplane=True,
                                         **test_args)
         
-        result = inference_config.config_and_run_inference(use_thread=False)
+        result = inference_config.config_and_run_inference()
         for _, stack in result.items():
             assert isinstance(stack, np.ndarray)
             assert stack.shape == expected_shape
@@ -227,14 +227,14 @@ class TestVolumeInference:
         viewer = ViewerModel()
         image_layer = viewer.add_image(tutorial_3d_image)
 
-        inference_config = VolumeInferenceWidget(viewer=viewer,
+        inference_config = VolumeSegPipeline(viewer=viewer,
                                         image_layer=image_layer,
                                         use_gpu=True,
                                         return_panoptic=True,
                                         orthoplane=True,
                                         **test_args)
 
-        result = inference_config.config_and_run_inference(use_thread=False)
+        result = inference_config.config_and_run_inference()
         tolerance = 0.1  # 10% tolerance
 
         for (_, stack), expected_label in zip(result.items(), expected_labels):

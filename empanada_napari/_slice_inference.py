@@ -1,7 +1,5 @@
-import math
 import sys
 
-import joblib
 import numpy as np
 import dask.array as da
 import ome_zarr
@@ -25,10 +23,12 @@ from ome_zarr_models import open_ome_zarr
 from scipy.ndimage import binary_dilation
 
 from empanada.config_loaders import read_yaml
-from empanada.seg_executors import SerialExecutor, ParallelExecutor
+from empanada.seg_executors import (
+    SingleRegionExecutor, ChunkedExecutor, SingleSliceStrategy, BatchSliceStrategy
+)
 from empanada_napari.inference import Engine2d
 from empanada_napari.utils import get_configs, abspath
-from empanada.zarr_utils import _write_empty_chunk, _generate_tiles, _write_multiscale
+from empanada.zarr_utils import _write_multiscale
 
 from napari import Viewer
 from napari.layers import Image, Labels, Shapes
@@ -114,262 +114,26 @@ class SliceInference:
         image, axis, plane, y, x = self._get_image_as_array(self.image_layer)
         print(image.shape, self.image_layer.shape)
 
-        '''Step 4: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
+        '''Step 4: Pick the InferenceStrategy (batch vs single-slice) and
+        the Executor (chunked vs single-region) for this run.'''
+        strategy = (BatchSliceStrategy if self.batch_mode else SingleSliceStrategy)(
+            fill_holes_in_segmentation=self.fill_holes
+        )
+
         if type(image) == da.Array and zarr_inpath and zarr_outpath:
-            scale=2
-            executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes)
+            executor = ChunkedExecutor(
+                strategy, zarr_inpath, zarr_outpath, scale=2,
+                multiscale_writer=self.write_out_multiscale
+            )
         else:
-            executor = SerialExecutor(self.fill_holes)
+            executor = SingleRegionExecutor(strategy)
 
         '''Step 5: Return the computed segmentation array'''
-        seg, axis, plane, y, x = executor.run_workflow(self.engine, image, axis, plane, y, x)
-   
+        seg, axis, plane, y, x = executor.run_workflow(
+            self.engine, image, axis=axis, plane=plane, y=y, x=x
+        )
+
         return seg, axis, plane, y, x
-    
-
-    def _zarr_seg_workflow(self, image, axis, plane, y, x):
-        store_path = '/home/efv97572/empanada_tem/2dout4.ome.zarr'
-        # Create OME-Zarr store with empty array with same shape as image, and an array == downsampled-by-2 
-        zout_down = _write_empty_chunk(store_path, image, inp_scale=[0.005,0.005]) # inp_scale needs to come from input image zarr store
-        
-        # First, downsample the 'image' array and rechunk it into 4 panels
-        image_down = image[::2, ::2]# da.coarsen(np.mean, image, { -2: 2, -1: 2 })
-            # Later, we will get this array directly from the zarr store
-        tile_shape = [dim//2 for dim in image_down.shape]
-        chunk_indices = list(_generate_tiles(image_down.shape, tile_shape))
-        print("CHUNK INDICES:", image_down.shape, chunk_indices)
-
-        ### ClassIDs based on chunk indices:
-        self.class_ids = {}
-        class_id = 1
-        divisor = 1000
-        for chunk_idx in chunk_indices:
-            id = (chunk_idx[0].start + chunk_idx[1].stop)//100 * 100
-            # print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
-            self.class_ids[id] = class_id*divisor
-            class_id += 1
-
-        # Second, run inference on the panels in parallel
-        delayed_run_segmentation = joblib.delayed(self.run_segmentation)
-        jobs = [delayed_run_segmentation(image_down[idx], axis, plane, y, x, zout_down, idx) for idx in chunk_indices]
-        for job in jobs: print("Job:", job)
-        executor = joblib.Parallel(n_jobs=-1, backend='threading')
-        executor(jobs) 
-        
-        # Third, Get the strips along the panel "seams" & run segmentation
-        pad = 400
-        y_chunk = image_down.shape[0]//2
-        x_chunk = image_down.shape[1]//2
-
-        v_idx = (slice(0, image_down.shape[0], None), slice(x_chunk-pad, x_chunk+pad, None))
-        h_idx = (slice(y_chunk-pad, y_chunk+pad, None), slice(0, image_down.shape[1], None))
-        vertical_strip = image_down[v_idx]
-        horizontal_strip = image_down[h_idx]
-
-        for chunk_idx in [v_idx, h_idx]:
-            id = (chunk_idx[0].start + chunk_idx[1].stop)//100 * 100
-            # print("ID = ", chunk_idx[0].start, "+", chunk_idx[1].stop, "=", id)
-            self.class_ids[id] = class_id*divisor
-            class_id += 1
-
-        # print("ClassIDs:", self.class_ids, len(chunk_indices))
-
-        self.run_segmentation(vertical_strip, axis, plane, y, x, zout_down, v_idx, merge_labels=True)
-        self.run_segmentation(horizontal_strip, axis, plane, y, x, zout_down, h_idx, merge_labels=True)
-
-
-        # 1. Get a list of unique labels from the zarr out array
-        downseg = da.from_zarr(f"{store_path}/labels/tmp/s0/") 
-        unique_labels = da.unique(downseg).compute()
-        if unique_labels[0] == 0:
-            unique_labels = unique_labels[1:] 
-
-        # 2. Get the number of classes we need, from self.maximum_objects_per_class
-        num_classes = math.ceil(len(unique_labels)/self.maximum_objects_per_class)
-        # Turn this into an int array
-        new_ids = []
-     
-        for class_id in range(1, num_classes+1):
-            min_id = (class_id*self.maximum_objects_per_class) + 1
-            max_id = ((class_id+1) * self.maximum_objects_per_class) - 1
-
-            if max_id > len(unique_labels):
-                max_obj_id = len(unique_labels)+1 % max(num_classes-1, 1) 
-                max_id = max_obj_id + (class_id*self.maximum_objects_per_class)
-
-            new_ids.extend(np.arange(min_id, max_id))
-
-        # 3. Unique_labels is already sorted, as is new_ids
-        id_map = dict(zip(unique_labels, new_ids))
-
-        # Build a global LookUp Table:
-        max_key = max(unique_labels)
-        lut = np.arange(max_key+1, dtype=np.int64)
-        for old, new in id_map.items():
-            lut[old] = new
-        
-        # 4. Apply the dict map in parallel, to each chunk in seg array 
-        # use the outseg zarr store (zout_down) & original chunk_indices
-        delayed_apply_mapping = joblib.delayed(self.apply_mapping)
-        jobs = [delayed_apply_mapping(downseg[idx], lut=lut, zarr_store=zout_down, slice_idx=idx) for idx in chunk_indices]
-        # Using downseg array here as input arr to be re-mapped? & writes out to zout_down? 
-        for job in jobs: print("Remapping Job:", job)
-        executor = joblib.Parallel(n_jobs=-1, backend='threading')
-        executor(jobs) 
-        '''Label reconciliation Done!'''
-
-
-        # Fifth, use this array and upscale it to get the highest res array, DO NOT RE-SEGMENT
-        image_store = "https://bioimaging-01-pub.livingobjects.ebi.ac.uk/phase1test/EMPIAR-10311-IM1.zarr"  #The original image's zarr store
-        self.write_out_multiscale(image_store, image, store_path, zout_down)
-
-        # Done.   
-
-        print("Segmentation Done.")
-        return da.from_zarr(zout_down)
-
-
-    def run_segmentation(self, input_array, axis, plane, y, x, zarr_store=None, slice_idx=None, merge_labels=False):
-        if isinstance(input_array, da.Array):
-            input_array = input_array.compute() 
-
-        if self.batch_mode:
-            assert not self.output_to_layer, "Batch mode is not compatible with output to layer!"
-            assert not self.image_layer.multiscale, "Batch mode is not compatible with multiscale images!"
-            assert not self.viewport, "Batch mode is not compatible with viewport inference!"
-            assert not self.confine_to_roi, "Batch mode is not compatible with ROI inference!"
-            
-            print("Running Batch Mode Inference:")
-            seg, axis, plane, y, x = self._run_model_batch(self.engine, input_array, self.fill_holes)
-
-            # Future: batch_mode_runner method will be this^ in sliceinference, and napari threaded ver in sliceinferencewidget (DRY)
-            # Same for regular runner below
-        else:
-            seg, axis, plane, y, x = self._run_model(self.engine, input_array, axis, plane, y, x, self.fill_holes)
-
-        if zarr_store is not None:
-            # Get this chunk's classID:
-            id = (slice_idx[0].start + slice_idx[1].stop)//100 * 100
-            class_id = self.class_ids[id]
-            old_divisor = self.maximum_objects_per_class
-
-            unique_labels = np.unique(seg[seg>0])
-
-            # Update all labels in seg to be class_id
-            mapping = {
-                old_label: (old_label-old_divisor)+class_id
-                for old_label in unique_labels
-            }
-            seg = self.apply_mapping(seg, mapping)
-
-
-            if not merge_labels:
-                # print("not merging labels")
-                final = seg
-        
-            else:
-                print("merging labels...")
-                # Merge overlapping labels into same label
-                existing = zarr_store[slice_idx]
-
-                seg2_to_seg1 = self.build_mapping(existing, seg)
-                seg2_fixed = self.apply_mapping(seg, seg2_to_seg1)
-
-                final = existing.copy()
-                mask = seg2_fixed > 0
-                final[mask] = seg2_fixed[mask]
-                print("Saving...")
-
-            zarr_store[slice_idx] = final
-            
-            return
-        return seg, axis, plane, y, x
-
-    def apply_mapping(self, seg, mapping=None, lut=None, zarr_store=None, slice_idx=None):
-
-        print("replacing labels...")
-
-        if lut is None:
-            max_key = max(mapping)
-            lut = np.arange(max_key + 1, dtype=np.int64)
-
-            for old, new in mapping.items():
-                lut[old] = new
-
-        out = lut[seg]
-
-        # print("MAP: ", mapping)
-        # print("Unique seg:", np.unique(seg))
-        # print("OUT>0 LABELS: ", out[out>0])
-        
-        # out = seg.copy()    
-        # for old, new in mapping.items():
-        #     out[seg == old] = new   
-
-        if zarr_store and slice_idx:
-            zarr_store[slice_idx] = out
-            print("exported finalised labels!")
-            return
-        
-        return out
-
-    def build_mapping(self, seg1, seg2, min_conf=0.8):
-        mapping = {}
-        seg2_labels = np.unique(seg2[seg2>0])
-
-        for l2 in seg2_labels:
-            mask = seg2 == l2
-
-            overlap = seg1[mask]
-            overlap = overlap[overlap > 0]
-
-            if len(overlap) == 0:
-                continue
-
-            labels, counts = np.unique(overlap, return_counts=True)
-
-            best = np.argmax(counts)
-            best_label = labels[best]
-
-            conf = counts[best] / counts.sum()
-
-            if conf >= min_conf:
-                mapping[l2] = best_label
-
-        return mapping
-
-    def align_seg2_to_seg1(self, seg1, seg2, min_overlap=0.5):
-        """
-        For each seg2 label:
-            assign it the seg1 label it overlaps most
-        """
-
-        seg2_out = np.zeros_like(seg2)
-
-        seg2_labels = np.unique(seg2)
-        seg2_labels = seg2_labels[seg2_labels > 0]
-
-        for l2 in seg2_labels:
-
-            mask = seg2 == l2
-
-            overlap = seg1[mask]
-            overlap = overlap[overlap > 0]
-
-            if len(overlap) == 0:
-                continue
-
-            labels, counts = np.unique(overlap, return_counts=True)
-
-            best_idx = np.argmax(counts)
-            best_label = labels[best_idx]
-
-            confidence = counts[best_idx] / counts.sum()
-
-            if confidence >= min_overlap:
-                seg2_out[mask] = best_label
-
-        return seg2_out
 
     def _load_ome_zarr(self, path: str) -> None:
         """
@@ -562,7 +326,7 @@ class SliceInference:
 
 
 
-class SliceInferenceWidget(SliceInference):
+class SliceSegPipeline(SliceInference):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -832,7 +596,7 @@ def slice_inference_widget():
     ):
 
         # instantiate the class
-        inference_config = SliceInferenceWidget(viewer=viewer,
+        inference_config = SliceSegPipeline(viewer=viewer,
             label_head=label_head,
             image_layer=image_layer,
             model_config=model_config,
@@ -856,8 +620,7 @@ def slice_inference_widget():
             )
         
         # method that configures & runs inference
-        # use_thread=True will output result to napari layer/viewer
-        inference_config.config_and_run_inference(use_thread=True)
+        inference_config.config_and_run_inference()
         pbar.show()
 
     # make the scroll available

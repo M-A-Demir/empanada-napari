@@ -2,14 +2,12 @@ import os
 import time
 import zarr
 import torch
-import joblib
 import napari
 import numpy as np
 import dask.array as da
 
 from napari import Viewer
 from napari.layers import Image
-from napari.qt.threading import thread_worker
 from napari_plugin_engine import napari_hook_implementation
 from magicgui import widgets, magic_factory
 from qtpy.QtWidgets import QScrollArea
@@ -17,13 +15,13 @@ from qtpy.QtWidgets import QScrollArea
 from pathlib import Path
 from itertools import product
 from torch.cuda import device_count
-from dask.array.core import slices_from_chunks
-from empanada.seg_executors import SerialExecutor, ParallelExecutor
+from empanada.seg_executors import (
+    SingleRegionExecutor, ChunkedExecutor, StackStrategy, OrthoplaneStrategy
+)
 from empanada_napari.inference import Engine3d, _tracker_consensus, tracker_consensus, _stack_postprocessing, stack_postprocessing
 from empanada_napari.multigpu import MultiGPUEngine3d
 from empanada_napari.utils import get_configs, abspath
 from empanada.config_loaders import read_yaml
-from empanada.zarr_utils import _write_empty_chunk, all_chunk_indices
 
 
 
@@ -137,40 +135,31 @@ class VolumeInference:
         image = self._get_image_as_array(self.image)
         print(image.shape, self.image.shape)
 
-        '''Step 5: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
+        '''Step 5: Pick the InferenceStrategy (stack vs orthoplane) and the
+        Executor (chunked vs single-region) for this run.'''
+        strategy = (OrthoplaneStrategy if self.orthoplane else StackStrategy)(
+            fill_holes_in_segmentation=self.fill_holes
+        )
+
         if type(image) == da.Array and zarr_inpath and zarr_outpath:
-            scale=2
-            executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes, self.orthoplane)
+            executor = ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=2)
         else:
-            executor = SerialExecutor(self.fill_holes, self.orthoplane)
+            executor = SingleRegionExecutor(strategy)
 
-        '''Step 6: Return the computed segmentation array'''
-        result = executor.run_workflow(self.engine, image, plane=self.inference_plane)
-        return result
-   
+        '''Step 6: Run the workflow, then postprocess (filter + rasterize
+        per class) using the existing, unmodified postprocessing/
+        consensus machinery -- StackStrategy and OrthoplaneStrategy both
+        return the same (trackers_dict, axes_dict) shape, so the same
+        dispatch that used to happen inline can happen right here.'''
+        trackers_dict, axes_dict = executor.run_workflow(
+            self.engine, image, axis_name=self.inference_plane,
+            pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view
+        )
 
-    def run_segmentation(self, input_array, zarr_store, slice_idx):
-        if type(input_array) == da.core.Array:
-            input_array = input_array.compute()
-        print("Running on Slice: ", slice_idx)
-
-        # Run inference and get result
         if self.orthoplane:
-            print("Running Orthoplane Inference:")
-            result = self._orthoplane_inference(self.engine, input_array)
-            result = self.start_consensus_worker(result)
-        
+            return self.start_consensus_worker(trackers_dict)
         else:
-            print("Running Stack Inference:")
-            result = self._stack_inference(self.engine, input_array, self.inference_plane)
-            result = self.start_postprocess_worker(result)
-
-        print(len(result), result[0])
-        # write out result to out zarr
-        # print("DEBUGGING:", result.shape, result.chunks, slice_idx)
-        zarr_store[slice_idx] = result[0][0]
-        
-        return
+            return self.start_postprocess_worker(trackers_dict)
 
     # ---------------- Engine management ----------------
     def get_engine(self):
@@ -273,39 +262,19 @@ class VolumeInference:
 
         return image
 
-    # ---------------- Inference runners ----------------
-    def _stack_inference(self, engine, volume, axis_name):
-        stack, trackers = engine.infer_on_axis(volume, axis_name)
-        trackers_dict = {axis_name: trackers}
-        return stack, axis_name, trackers_dict
-
-    def _orthoplane_inference(self, engine, volume):
-        trackers_dict = {}
-        axes_dict = {}
-        axes_dict = {}
-        for axis_name in ['xy', 'xz', 'yz']:
-            stack, trackers = engine.infer_on_axis(volume, axis_name)
-            trackers_dict[axis_name] = trackers
-            
-            # report instances per class
-            for tracker in trackers:
-                class_id = tracker.class_id
-                print(f'Class {class_id}, axis {axis_name}, has {len(tracker.instances.keys())} instances')
-            axes_dict[axis_name] = stack
-        return trackers_dict, axes_dict
-
-    def start_postprocess_worker(self, *args):
-        trackers_dict = args[0][2]
+    # ---------------- Postprocessing (unchanged: filters + rasterizes
+    # per class using the existing consensus/postprocessing machinery in
+    # empanada_napari.inference; StackStrategy/OrthoplaneStrategy inference
+    # itself now lives entirely in empanada.seg_executors.strategy) -------
+    def start_postprocess_worker(self, trackers_dict):
         stack_result = list(_stack_postprocessing(
             trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
             min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype, chunk_size=self.chunk_size
         ))
 
         return stack_result
-        
-    def start_consensus_worker(self, *args):
-        trackers_dict, axes_dict = args[0][0], args[0][1]
 
+    def start_consensus_worker(self, trackers_dict):
         # get consensus stack from the trackers_dict
         consensus_result = list(_tracker_consensus(
             trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
@@ -317,7 +286,7 @@ class VolumeInference:
         return consensus_result
     
 
-class VolumeInferenceWidget(VolumeInference):
+class VolumeSegPipeline(VolumeInference):
     def __init__(self,
             image_layer: Image,
             viewer: Viewer = None,
@@ -378,102 +347,14 @@ class VolumeInferenceWidget(VolumeInference):
         self._check_option_compatibility()
         self.pbar = pbar
 
-# ---------------- Option handling & inference running entrypoint ----------------
-    def config_and_run_inference(self, zarr_inpath=None, zarr_outpath=None):
-        '''Step 1: Load the model config'''
-        model_configs = get_configs()
-        self.model_config = read_yaml(model_configs[self.model_config_name])
+    # ---------------- Option handling & inference running entrypoint ----------------
+    # config_and_run_inference is inherited unchanged from VolumeInference:
+    # this override used to duplicate it exactly, followed by a large block
+    # of unreachable code after an early `return` (a second, hand-rolled
+    # dask-chunk loop referencing a since-removed zarr_utils helper). The
+    # working half is now identical to the base class's rewired version, so
+    # inheriting it directly removes the duplication.
 
-        if self.last_config is None:
-            self.last_config = self.model_config_name
-
-        '''Step 2: Create storage url from layer name and model config'''
-        if not self.use_store_dir: # This is a default -
-            self.store_url = None
-            print(f'Running without zarr storage directory, this may use a lot of memory!')
-        else:
-            # Consider using this url for both: regular Zarr output & OME-Zarr output
-            self.store_url = os.path.join(self.store_dir, f'{self.image_layer.name}_{self.model_config_name}.zarr')
-
-        '''Step 3: Setup the Engine'''
-        self.get_engine()
-
-        '''Step 4: Get the 3d slice from the image'''
-        image = self._get_image_as_array(self.image)
-        print(image.shape, self.image.shape)
-
-        '''Step 5: Setup the appropriate Segmentation Executor based on image datatype & if zarr was provided'''
-        if type(image) == da.Array and zarr_inpath and zarr_outpath:
-            scale=2
-            executor = ParallelExecutor(zarr_inpath, zarr_outpath, scale, self.fill_holes, self.orthoplane)
-        else:
-            executor = SerialExecutor(self.fill_holes, self.orthoplane)
-
-        '''Step 6: Return the computed segmentation array'''
-        result = executor.run_workflow(self.engine, image, plane=self.inference_plane)
-        return result
-
-
-        if type(image) == da.core.Array:
-            # If loaded dask array, write the empty output zarr array to disk
-            store_path = '/home/efv97572/empanada_tem/out2.ome.zarr'
-            zout = _write_empty_chunk(store_path, image)
-            chunk_indices = list(slices_from_chunks(image.chunks)) # may not need to be a list
-            # chunk_indices = all_chunk_indices(image)
-            
-            delayed_run_segmentation = joblib.delayed(self.run_segmentation)
-            jobs = [delayed_run_segmentation(image, zout, idx) for idx in chunk_indices][:10]
-
-            for job in jobs:
-                print("Job:", job)
-    
-            executor = joblib.Parallel(n_jobs=-1, backend='threading')
-            executor(jobs)
-
-            print("Done.")
-            return
-    
-            # If loaded dask array, write the empty output zarr array to disk
-            zout = _write_empty_chunk(image, self.image_layer.scale, self.image_layer.units)
-
-            # mapped_data = da.map_blocks(my_function, data) equiv to below
-            # stack = image.map_blocks(self._determine_inference)
-
-            # Write stack to chunk it came from
-            # slices_per_dim = chunk_slices(image.chunks)
-
-            
-            for idx in np.ndindex(image.numblocks):
-                chunk = image.blocks[idx].compute()
-                
-                if chunk.dtype != np.uint8:
-                    chunk = chunk.astype(np.uint8)
-                print("WORKING ON CHUNK:", idx, chunk.shape, chunk.dtype)
-
-                result = self._stack_inference(self.engine, chunk, self.inference_plane)
-                result = self.start_postprocess_worker(result)
-                seg = result[0][0]
-                print("Dtype:", type(result), type(result[0][2]), type(seg))
-
-                slices = tuple(
-                            slice(sum(image.chunks[dim][:i]), sum(image.chunks[dim][:i+1]))
-                            for dim, i in enumerate(idx)
-                        )
-                
-                print(f"Result chunk shape: {seg.shape}")
-                seg[2,2,2] = 156
-                zout[slices] = seg
-                
-                print("image.chunks:", image.chunks)
-                print("image.numblocks:", image.numblocks)
-                print("image.shape:", image.shape)
-                print("zout.shape:", zout.shape)
-                print("zout.chunks:", zout.chunks)
-            print("Done.")
-                # return
-
-        return
-    
     def _get_image_as_array(self, image):
         # Get the 3d slice from the image (Can mock a layer/viewer object in the tests)
         if self.image_layer.multiscale:
@@ -592,17 +473,6 @@ class VolumeInferenceWidget(VolumeInference):
     #     )
     #     consensus_worker.yielded.connect(self._new_class_stack) # supposed to add consensus as layer
     #     consensus_worker.start()
-
-
-    # ---------------- Inference runners ----------------
-    @thread_worker
-    def stack_inference(self, engine, volume, axis_name):
-        return self._stack_inference(engine, volume, axis_name)
-
-    @thread_worker
-    def orthoplane_inference(self, engine, volume):
-        return self._orthoplane_inference(engine, volume)
-
 
 
 def volume_inference_widget():
@@ -756,7 +626,7 @@ def volume_inference_widget():
             pbar: widgets.ProgressBar
     ):
         # instantiate the class
-        inference_config = VolumeInferenceWidget(viewer = viewer,
+        inference_config = VolumeSegPipeline(viewer = viewer,
             label_head = label_head,
             image_layer = image_layer,
             model_config = model_config,
