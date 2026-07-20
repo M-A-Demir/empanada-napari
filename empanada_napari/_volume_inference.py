@@ -8,6 +8,7 @@ import dask.array as da
 
 from napari import Viewer
 from napari.layers import Image
+from napari.qt.threading import thread_worker
 from napari_plugin_engine import napari_hook_implementation
 from magicgui import widgets, magic_factory
 from qtpy.QtWidgets import QScrollArea
@@ -15,327 +16,22 @@ from qtpy.QtWidgets import QScrollArea
 from pathlib import Path
 from itertools import product
 from torch.cuda import device_count
-from empanada.seg_executors import (
-    SingleRegionExecutor, ChunkedExecutor, StackStrategy, OrthoplaneStrategy
-)
-from empanada_napari.inference import Engine3d, _tracker_consensus, tracker_consensus, _stack_postprocessing, stack_postprocessing
-from empanada_napari.multigpu import MultiGPUEngine3d
-from empanada_napari.utils import get_configs, abspath
-from empanada.config_loaders import read_yaml
-
-
+from empanada.inference.volume_inference import VolumeSegPipeline
 
 quantized_supported = True
 if torch.backends.quantized.engine in (None or 'none'):
     quantized_supported = False
 
-class VolumeInference:
-    def __init__(self,
-            image: np.ndarray | da.Array | zarr.array,
-            model_config: str,
-            multiscale_level: int=0,
-            label_head: dict = None,
-            use_gpu: bool = False,
-            use_quantized: bool = False,
-            multigpu: bool = False,
 
-            downsampling: int = 1,
-            confidence_thr: float = 0.5,
-            center_confidence_thr: float = 0.1,
-            min_distance_object_centers: int = 3,
-            fine_boundaries: bool = False,
-            semantic_only: bool = False,
-
-            median_slices: int = 3,
-            min_size: int = 500,
-            min_extent: int = 5,
-            maximum_objects_per_class: str = '10000',
-            inference_plane: str = 'xy',
-
-            label_erosion: int = 0,
-            label_dilation: int = 0,
-            fill_holes_in_segmentation: bool = False,
-            orthoplane: bool = False,
-            return_panoptic: bool = False,
-            pixel_vote_thr: int = 2,
-            allow_one_view: bool = False,
-
-            use_store_dir: bool = False,
-            store_dir: str = None,
-            chunk_size: int|list[int] = 256,
-
-            
-    ):
-        
-        self.image = image
-        self.label_head = label_head
-        self.multiscale_level = multiscale_level
-        self.model_config_name = model_config
-        self.use_gpu = use_gpu
-        self.use_quantized = use_quantized
-        self.multigpu = multigpu
-
-        self.downsampling = downsampling
-        self.confidence_thr = confidence_thr
-        self.center_confidence_thr = center_confidence_thr
-        self.min_distance_object_centers = min_distance_object_centers
-        self.fine_boundaries = fine_boundaries
-        self.semantic_only = semantic_only
-
-        self.median_slices = median_slices
-        self.min_size = min_size
-        self.min_extent = min_extent
-        self.maximum_objects_per_class = int(maximum_objects_per_class)
-        self.inference_plane = inference_plane
-
-        self.label_erosion = label_erosion
-        self.label_dilation = label_dilation
-        self.fill_holes = fill_holes_in_segmentation
-        self.orthoplane = orthoplane
-        self.return_panoptic = return_panoptic
-        self.pixel_vote_thr = pixel_vote_thr
-        self.allow_one_view = allow_one_view
-
-        self.use_store_dir = use_store_dir
-        self.store_dir = str(store_dir)
-        self.last_config = None
-        self.engine = None
-
-        if type(chunk_size) == int: chunk_size = [chunk_size]
-        if len(chunk_size) == 1:
-            self.chunk_size = tuple(int(chunk_size[0]) for _ in range(3))
-        else:
-            assert len(chunk_size) == 3, f"Chunk size must be 1 or 3 integers, got {chunk_size}"
-            self.chunk_size = tuple(int(s) for s in chunk_size)
-
-        self._check_option_compatibility()
-
-
-    # ---------------- Option handling & inference running entrypoint ----------------
-    def config_and_run_inference(self, zarr_inpath=None, zarr_outpath=None):
-        '''Step 1: Load the model config'''
-        model_configs = get_configs()
-        self.model_config = read_yaml(model_configs[self.model_config_name])
-
-        if self.last_config is None:
-            self.last_config = self.model_config_name
-
-        '''Step 2: Create storage url from layer name and model config'''
-        if not self.use_store_dir: # This is a default -
-            self.store_url = None
-            print(f'Running without zarr storage directory, this may use a lot of memory!')
-        else:
-            # Consider using this url for both: regular Zarr output & OME-Zarr output
-            self.store_url = os.path.join(self.store_dir, f'{self.image_layer.name}_{self.model_config_name}.zarr')
-
-        '''Step 3: Setup the Engine'''
-        self.get_engine()
-
-        '''Step 4: Get the 3d slice from the image'''
-        image = self._get_image_as_array(self.image)
-        print(image.shape, self.image.shape)
-
-        '''Step 5: Pick the InferenceStrategy (stack vs orthoplane) and the
-        Executor (chunked vs single-region) for this run.'''
-        strategy = (OrthoplaneStrategy if self.orthoplane else StackStrategy)(
-            fill_holes_in_segmentation=self.fill_holes
-        )
-
-        if type(image) == da.Array and zarr_inpath and zarr_outpath:
-            executor = ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=2)
-        else:
-            executor = SingleRegionExecutor(strategy)
-
-        '''Step 6: Run the workflow, then postprocess (filter + rasterize
-        per class) using the existing, unmodified postprocessing/
-        consensus machinery -- StackStrategy and OrthoplaneStrategy both
-        return the same (trackers_dict, axes_dict) shape, so the same
-        dispatch that used to happen inline can happen right here.'''
-        trackers_dict, axes_dict = executor.run_workflow(
-            self.engine, image, axis_name=self.inference_plane,
-            pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view
-        )
-
-        if self.orthoplane:
-            return self.start_consensus_worker(trackers_dict)
-        else:
-            return self.start_postprocess_worker(trackers_dict)
-
-    # ---------------- Engine management ----------------
-    def get_engine(self):
-        reload_engine = (
-            self.engine is None
-            or self.last_config != self.model_config_name
-        )
-
-        if reload_engine:
-            self.engine = Engine3d(
-                self.model_config,
-                inference_scale=self.downsampling,
-                median_kernel_size=self.median_slices,
-                nms_kernel=self.min_distance_object_centers,
-                nms_threshold=self.center_confidence_thr,
-                confidence_thr=self.confidence_thr,
-                min_size=self.min_size,
-                min_extent=self.min_extent,
-                fine_boundaries=self.fine_boundaries,
-                label_divisor=self.maximum_objects_per_class,
-                use_gpu=self.use_gpu,
-                use_quantized=self.use_quantized,
-                semantic_only=self.semantic_only,
-                save_panoptic=self.return_panoptic,
-                store_url=self.store_url,
-                chunk_size=self.chunk_size,
-                label_erosion=self.label_erosion,
-                label_dilation=self.label_dilation,
-                fill_holes_in_segmentation=self.fill_holes
-            )
-            self.last_config = self.model_config_name
-            self.using_gpu = self.use_gpu
-
-        elif self.multigpu:
-            self.engine = MultiGPUEngine3d(
-                self.model_config,
-                inference_scale=self.downsampling,
-                median_kernel_size=self.median_slices,
-                nms_kernel=self.min_distance_object_centers,
-                nms_threshold=self.center_confidence_thr,
-                confidence_thr=self.confidence_thr,
-                min_size=self.min_size,
-                min_extent=self.min_extent,
-                fine_boundaries=self.fine_boundaries,
-                label_divisor=self.maximum_objects_per_class,
-                semantic_only=self.semantic_only,
-                save_panoptic=self.return_panoptic,
-                store_url=self.store_url,
-                chunk_size=self.chunk_size
-            )
-            self.last_config = self.model_config_name
-
-        else:
-            # update the parameters
-            self.engine.update_params(
-                inference_scale=self.downsampling,
-                median_kernel_size=self.median_slices,
-                nms_kernel=self.min_distance_object_centers,
-                nms_threshold=self.center_confidence_thr,
-                confidence_thr=self.confidence_thr,
-                min_size=self.min_size,
-                min_extent=self.min_extent,
-                fine_boundaries=self.fine_boundaries,
-                label_divisor=self.maximum_objects_per_class,
-                semantic_only=self.semantic_only,
-                save_panoptic=self.return_panoptic,
-                store_url=self.store_url,
-                chunk_size=self.chunk_size,
-                label_erosion=self.label_erosion,
-                label_dilation=self.label_dilation,
-                fill_holes_in_segmentation=self.fill_holes
-            )
-        return
-
-    # ---------------- Helper methods ----------------
-    def _check_option_compatibility(self):
-        if quantized_supported == False and self.use_quantized:
-            raise RuntimeWarning(
-                f" No quantized backend is selected. torch.backends.quantized.engine = {torch.backends.quantized.engine} Using Quantized Model may fail."
-            )
-        return
-    
-    def _get_image_as_array(self, image):
-        # Get the 3d slice from the image 
-
-        # Verify that the image doesn't have extraneous channel dimensions
-        assert image.ndim in [3, 4], "Only 3D and 4D input images can be handled!"
-        if image.ndim == 4:
-            # Channel dimensions are commonly 1, 3 and 4
-            # Check for dimensions on zeroth and last axes
-            shape = image.shape
-            if shape[0] in [1, 3, 4]:
-                image = image[0]
-            elif shape[-1] in [1, 3, 4]:
-                image = image[..., 0]
-            else:
-                raise Exception(f'Image volume must be 3D, got image of shape {shape}')
-
-            print(f'Got 4D image of shape {shape}, extracted single channel of size {image.shape}')
-
-        return image
-
-    # ---------------- Postprocessing (unchanged: filters + rasterizes
-    # per class using the existing consensus/postprocessing machinery in
-    # empanada_napari.inference; StackStrategy/OrthoplaneStrategy inference
-    # itself now lives entirely in empanada.seg_executors.strategy) -------
-    def start_postprocess_worker(self, trackers_dict):
-        stack_result = list(_stack_postprocessing(
-            trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
-            min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype, chunk_size=self.chunk_size
-        ))
-
-        return stack_result
-
-    def start_consensus_worker(self, trackers_dict):
-        # get consensus stack from the trackers_dict
-        consensus_result = list(_tracker_consensus(
-            trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
-            pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view,
-            min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype,
-            chunk_size=self.chunk_size
-        ))
-
-        return consensus_result
-    
-
-class VolumeSegPipeline(VolumeInference):
-    def __init__(self,
-            image_layer: Image,
-            viewer: Viewer = None,
-            model_config: str = None,
-            multiscale_level: int=0,
-            label_head: dict = None,
-            use_gpu: bool = False,
-            use_quantized: bool = False,
-            multigpu: bool = False,
-
-            downsampling: int = 1,
-            confidence_thr: float = 0.5,
-            center_confidence_thr: float = 0.1,
-            min_distance_object_centers: int = 3,
-            fine_boundaries: bool = False,
-            semantic_only: bool = False,
-
-            median_slices: int = 3,
-            min_size: int = 500,
-            min_extent: int = 5,
-            maximum_objects_per_class: str = '10000',
-            inference_plane: str = 'xy',
-
-            label_erosion: int = 0,
-            label_dilation: int = 0,
-            fill_holes_in_segmentation: bool = False,
-            orthoplane: bool = False,
-            return_panoptic: bool = False,
-            pixel_vote_thr: int = 2,
-            allow_one_view: bool = False,
-
-            use_store_dir: bool = False,
-            store_dir: str = None,
-            chunk_size: int|list[int] = 256,
-
-            pbar: widgets.ProgressBar = None
-    ):
-        super().__init__(image_layer.data, model_config, multiscale_level, label_head,
-        use_gpu, use_quantized, multigpu, downsampling, confidence_thr, 
-        center_confidence_thr, min_distance_object_centers, fine_boundaries, 
-        semantic_only, median_slices, min_size, min_extent,
-        maximum_objects_per_class, inference_plane, label_erosion,
-        label_dilation, fill_holes_in_segmentation, orthoplane,
-        return_panoptic, pixel_vote_thr, allow_one_view,
-        use_store_dir, store_dir, chunk_size)
-
+class VolumeSegPipelineGUI(VolumeSegPipeline):
+    def __init__(self, image_layer: Image, viewer: Viewer, pbar: widgets.ProgressBar = None,
+                 *args, **kwargs):
+        image = self._get_image_layer_as_array(image_layer)
         self.image_layer = image_layer
         self.viewer = viewer
-        self.label_head = label_head
+        self.pbar = pbar
+
+        super().__init__(image, *args, **kwargs)
 
         if type(chunk_size) == int: chunk_size = [chunk_size]
         if len(chunk_size) == 1:
@@ -344,44 +40,27 @@ class VolumeSegPipeline(VolumeInference):
             assert len(chunk_size) == 3, f"Chunk size must be 1 or 3 integers, got {chunk_size}"
             self.chunk_size = tuple(int(s) for s in chunk_size)
 
-        self._check_option_compatibility()
         self.pbar = pbar
 
-    # ---------------- Option handling & inference running entrypoint ----------------
-    # config_and_run_inference is inherited unchanged from VolumeInference:
-    # this override used to duplicate it exactly, followed by a large block
-    # of unreachable code after an early `return` (a second, hand-rolled
-    # dask-chunk loop referencing a since-removed zarr_utils helper). The
-    # working half is now identical to the base class's rewired version, so
-    # inheriting it directly removes the duplication.
+    # ---------------- (Threaded) Pipeline running entrypoint ----------------
+    @thread_worker
+    def run_in_thread(self, zarr_inpath=None, zarr_outpath=None):
+        return self.run(zarr_inpath, zarr_outpath)
 
-    def _get_image_as_array(self, image):
-        # Get the 3d slice from the image (Can mock a layer/viewer object in the tests)
+    # ---------------- Helper methods ----------------    
+    def _get_image_layer_as_array(self, image_layer):
+        return image_layer.data
+
+    def _preprocess_image_array(self):
         if self.image_layer.multiscale:
             print(f'Multiscale image selected, using resolution level {self.multiscale_level}!')
             try:
-                if self.multiscale_level <= len(image):
-                    image = image[self.multiscale_level]
+                if self.multiscale_level <= len(self.image):
+                    self.image = self.image[self.multiscale_level]
             except IndexError:
-                raise Exception(f'Maximum multiscale level is {len(image) - 1}, got multiscale level {self.multiscale_level}')
+                raise Exception(f'Maximum multiscale level is {len(self.image) - 1}, got multiscale level {self.multiscale_level}')
       
-
-        # Verify that the image doesn't have extraneous channel dimensions
-        assert image.ndim in [3, 4], "Only 3D and 4D input images can be handled!"
-        if image.ndim == 4:
-            # Channel dimensions are commonly 1, 3 and 4
-            # Check for dimensions on zeroth and last axes
-            shape = image.shape
-            if shape[0] in [1, 3, 4]:
-                image = image[0]
-            elif shape[-1] in [1, 3, 4]:
-                image = image[..., 0]
-            else:
-                raise Exception(f'Image volume must be 3D, got image of shape {shape}')
-
-            print(f'Got 4D image of shape {shape}, extracted single channel of size {image.shape}')
-
-        return image
+        return super()._preprocess_image_array()
 
 
 # ---------------- Napari Helper methods ----------------
@@ -422,15 +101,11 @@ class VolumeSegPipeline(VolumeInference):
         )
         self.pbar.hide()
 
-    def _new_segmentation(self, *args):
+    def new_segmentation(self, *args):
         mask = args[0][0]
         axis_name = args[0][1]
-        ###tmp
-        # zout = args[0][2]
-        # img_slice = args[0][3]
         if mask is not None:
             try:
-                # zout[img_slice] = mask  # Write out mask to chunk
                 self._new_layers(mask, f'panoptic-stack-{axis_name}')
                 for layer in self.viewer.layers:
                     layer.visible = False
@@ -439,7 +114,7 @@ class VolumeSegPipeline(VolumeInference):
             except Exception as e:
                 print(e)
 
-    def _new_class_stack(self, *args):
+    def new_class_stack(self, *args):
         masks, class_name, instances = args[0]
         try:
             self._new_layers(masks, f'{class_name}-prediction', instances)
@@ -449,30 +124,6 @@ class VolumeSegPipeline(VolumeInference):
             self.image_layer.visible = True
         except Exception as e:
             print(e)
-
-    # def start_postprocess_worker(self, *args):
-    #     trackers_dict = args[0][2]
-    #     postprocess_worker = stack_postprocessing(
-    #         trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
-    #         min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype, chunk_size=self.chunk_size
-    #     )
-    #     postprocess_worker.yielded.connect(self._new_class_stack)
-    #     postprocess_worker.start()
-
-    # def start_consensus_worker(self, trackers_dict, axes_dict):
-    #     # Add all the xy, xz, yz layers to napari:
-    #     for axis_name, mask in axes_dict.items():
-    #         self._new_segmentation((mask, axis_name))
-
-    #     # get consensus stack from the trackers_dict
-    #     consensus_worker = tracker_consensus(
-    #         trackers_dict, self.store_url, self.model_config, label_divisor=self.maximum_objects_per_class,
-    #         pixel_vote_thr=self.pixel_vote_thr, allow_one_view=self.allow_one_view,
-    #         min_size=self.min_size, min_extent=self.min_extent, dtype=self.engine.dtype,
-    #         chunk_size=self.chunk_size
-    #     )
-    #     consensus_worker.yielded.connect(self._new_class_stack) # supposed to add consensus as layer
-    #     consensus_worker.start()
 
 
 def volume_inference_widget():
@@ -626,8 +277,7 @@ def volume_inference_widget():
             pbar: widgets.ProgressBar
     ):
         # instantiate the class
-        inference_config = VolumeSegPipeline(viewer = viewer,
-            label_head = label_head,
+        pipeline = VolumeSegPipelineGUI(viewer = viewer,
             image_layer = image_layer,
             model_config = model_config,
             use_gpu = use_gpu,
@@ -655,12 +305,19 @@ def volume_inference_widget():
             use_store_dir=use_store_dir,
             store_dir = store_dir,
             chunk_size = chunk_size,
-            pbar = pbar
-    )
+            pbar = pbar)
 
         # method that configures & runs inference
-        # use_thread=True will output result to napari layer/viewer
-        inference_config.config_and_run_inference()
+        worker = pipeline.run_in_thread()
+
+        if orthoplane:
+            worker.returned.connect(pipeline.new_segmentation)
+            worker.returned.connect(pipeline.new_class_stack)      
+
+        else:
+            worker.returned.connect(pipeline.new_segmentation)
+            worker.returned.connect(pipeline.new_class_stack)
+
         pbar.show()
 
     # instantiate widget

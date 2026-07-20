@@ -1,304 +1,52 @@
-import sys
-
 import numpy as np
-import dask.array as da
-import ome_zarr
-import ome_zarr_models
-import zarr
 from time import time
 from tqdm import tqdm
 from skimage.draw import polygon
-from skimage.transform import resize
 
-from empanada.config_loaders import read_yaml
-from empanada_napari.inference import Engine2d
+from empanada.inference.slice_inference import SliceSegPipeline
 from empanada_napari.utils import get_configs, abspath
 
 from napari import Viewer
 from napari.layers import Image, Labels, Shapes
-from time import time
-from tqdm import tqdm
-from skimage.draw import polygon
-from ome_zarr_models import open_ome_zarr
-from scipy.ndimage import binary_dilation
-
-from empanada.config_loaders import read_yaml
-from empanada.seg_executors import (
-    SingleRegionExecutor, ChunkedExecutor, SingleSliceStrategy, BatchSliceStrategy
-)
-from empanada_napari.inference import Engine2d
-from empanada_napari.utils import get_configs, abspath
-from empanada.zarr_utils import _write_multiscale
-
-from napari import Viewer
-from napari.layers import Image, Labels, Shapes
+from napari.qt.threading import thread_worker
 from napari_plugin_engine import napari_hook_implementation
-
-from dask.array.core import slices_from_chunks
-
-from magicgui import magicgui, widgets
-from skimage import measure
-from scipy.ndimage import binary_fill_holes
 from qtpy.QtWidgets import QScrollArea
+from magicgui import magicgui, widgets
+
 from torch.cuda import device_count
 from torch.backends.quantized import engine
-from napari.qt.threading import thread_worker
+
 
 quantized_supported = True
 if engine in (None or 'none'):
     quantized_supported = False
-    
 
-class SliceInference:
-    def __init__(self, 
-            image_layer: np.ndarray | da.Array | zarr.array,
-            model_config: str,
-            viewer: Viewer = None,
-            label_head: dict = None,
-            downsampling: int = 1,
-            confidence_thr: float = 0.5,
-            center_confidence_thr: float = 0.1,
-            min_distance_object_centers: int = 3,
-            fine_boundaries: bool = False,
-            semantic_only: bool = False,
-            fill_holes_in_segmentation: bool = False,
-            maximum_objects_per_class: int = 10000,
-            tile_size: int = 0,
-            batch_mode: bool = False,
-            use_gpu: bool = False,
-            use_quantized: bool = False,
-            viewport: bool = False,
-            confine_to_roi: bool = False,
-            output_to_layer: bool = False,
-            output_layer: Labels = None,
-            pbar: widgets.ProgressBar = None
-    ):
-        self.viewer = viewer
-        self.label_head = label_head
+
+class SliceSegPipelineGUI(SliceSegPipeline):
+    def __init__(self, image_layer: Image, viewer: Viewer, viewport: bool = False,
+                 output_to_layer: bool = False, output_layer: Labels = None, pbar: widgets.ProgressBar = None,
+                 *args, **kwargs):
+        image = self._get_image_layer_as_array(image_layer)
         self.image_layer = image_layer
-        self.model_config_name = model_config
-        self.downsampling = downsampling
-        self.confidence_thr = confidence_thr
-        self.center_confidence_thr = center_confidence_thr
-        self.min_distance_object_centers = min_distance_object_centers
-        self.fine_boundaries = fine_boundaries
-        self.fill_holes = fill_holes_in_segmentation
-        self.tile_size = tile_size
-        self.batch_mode = batch_mode
-        self.semantic_only = semantic_only
-        self.using_gpu = use_gpu
-        self.using_quantized = use_quantized
+        self.viewer = viewer
         self.viewport = viewport
-        self.confine_to_roi = confine_to_roi
-        self.output_to_layer, self.output_layer = output_to_layer, output_layer
+        self.output_to_layer = output_to_layer
+        self.output_layer = output_layer
         self.pbar = pbar
-        self.maximum_objects_per_class = int(maximum_objects_per_class)
-        self.last_config = None
-        self.engine = None
 
-        self._check_option_compatibility()
+        super().__init__(image, *args, **kwargs)
 
-    # ---------------- Pipeline running entrypoint ----------------
-    def config_and_run_inference(self, zarr_inpath=None, zarr_outpath=None):  
-        '''Step 1: Load the model config'''
-        model_configs = get_configs()
-        self.model_config = read_yaml(model_configs[self.model_config_name])
-
-        if self.last_config is None:
-            self.last_config = self.model_config_name
-
-        '''Step 2: Setup the Engine'''
-        self.get_engine()
-                
-        '''Step 3: Get the 2D slice from the image array'''
-        image, axis, plane, y, x = self._get_image_as_array(self.image_layer)
-        print(image.shape, self.image_layer.shape)
-
-        '''Step 4: Pick the InferenceStrategy (batch vs single-slice) and
-        the Executor (chunked vs single-region) for this run.'''
-        strategy = (BatchSliceStrategy if self.batch_mode else SingleSliceStrategy)(
-            fill_holes_in_segmentation=self.fill_holes
-        )
-
-        if type(image) == da.Array and zarr_inpath and zarr_outpath:
-            executor = ChunkedExecutor(
-                strategy, zarr_inpath, zarr_outpath, scale=2,
-                multiscale_writer=self.write_out_multiscale
-            )
-        else:
-            executor = SingleRegionExecutor(strategy)
-
-        '''Step 5: Return the computed segmentation array'''
-        seg, axis, plane, y, x = executor.run_workflow(
-            self.engine, image, axis=axis, plane=plane, y=y, x=x
-        )
-
-        return seg, axis, plane, y, x
-
-    def _load_ome_zarr(self, path: str) -> None:
-        """
-        Load the OME-Zarr file's metadata.
-
-        Parameters
-        ----------
-        path : str
-            Path to OME-Zarr group.
-        """
-
-        group = zarr.open_group(path, mode="r")
-        multiscales = group.attrs["multiscales"]
-        datasets = multiscales[0]["datasets"]
-
-        return multiscales, datasets
-        
-
-    def write_out_multiscale(self, image_store, image_arr, seg_store, seg_arr):
-        # Load the coordinate transforms from the original dataset:
-        rtgroup = zarr.open_group(image_store, mode="r")
-        multiscales, coord_transforms = self._load_ome_zarr(image_store)
-        axes = multiscales[0]['axes']
-        dim_names = [ax['name'] for ax in axes if ax['name'] in ('y', 'x')]
-
-        abs_scales = []
-        scale_factors = [dict() for _ in coord_transforms]
-        for idx, ds in enumerate(coord_transforms):
-            axis_scale = ds['coordinateTransformations'][0]['scale']
-            abs_scales.append(axis_scale[-1])
-
-            for dim, scale in zip(dim_names, axis_scale):
-                if dim in ('y', 'x'):
-                    scale_factors[idx][dim] = scale
-
-        # Get datasets attr, correct the scale lengths
-        for dset in coord_transforms:
-            transform = dset["coordinateTransformations"][0]
-            transform["scale"] = transform["scale"][-2:]
-            dset["path"] = f"s{dset['path']}"
-
-        label_axes = []
-        for ax in axes:
-            if ax['name'] in ('y', 'x'):
-                label_axes.append(ax)
-
-        multiscales2 = rtgroup.attrs["multiscales"]
-        coord_transforms2 = multiscales2[0]["datasets"]
-        multidims = []
-        for d in coord_transforms2:
-            path = d["path"]
-            dims = rtgroup[path].shape
-            multidims.append(dims[-2:])
-
-
-        inp_scale = list(scale_factors[0].values())
-
-        scales = np.asarray([_['coordinateTransformations'][0]['scale'] for _ in coord_transforms])
-        scale_factors_raw = np.asarray(scales[1:]/scales[0], dtype="int")
-        scale_factors = [dict(zip(dim_names, pair)) for pair in scale_factors_raw]
-
-
-        # First, upscale the downscaled labels array to the full res shape:
-        # if seg_arr.shape != image_arr.shape:
-        #     full_seg = resize(seg_arr, (image_arr.shape[0], image_arr.shape[1]), order=0, 
-        #                      mode='reflect', anti_aliasing=False, preserve_range=True)
-        # else:
-        #     full_seg = seg_arr
-
-
-        # Now we have the full seg, we can write it out to the zarr store
-        # (NOTE: we may want to do the above resizing CHUNKWISE and write directly to ome-zarr store!)
-        # We can call the zout_down store something like 'tmp' in the outfile, and delete it later
-
-        
-        _write_multiscale(seg_store, seg_arr, scale_factors, multidims, datasets=coord_transforms, axes=label_axes)
-
-        return
-
-    # ---------------- Engine management ----------------
-    def get_engine(self):
-        reload_engine = (
-            self.engine is None
-            or self.last_config != self.model_config_name
-        )
-
-        if reload_engine:
-            self.engine = Engine2d(
-                self.model_config,
-                inference_scale=self.downsampling,
-                nms_kernel=self.min_distance_object_centers,
-                nms_threshold=self.center_confidence_thr,
-                confidence_thr=self.confidence_thr,
-                label_divisor=self.maximum_objects_per_class,
-                semantic_only=self.semantic_only,
-                fine_boundaries=self.fine_boundaries,
-                tile_size=self.tile_size,
-                use_gpu=self.using_gpu,
-                use_quantized=self.using_quantized,
-            )
-        else:
-            # update the parameters of the engine
-            # without reloading the model
-            self.engine.update_params(
-                inference_scale=self.downsampling,
-                label_divisor=self.maximum_objects_per_class,
-                nms_threshold=self.center_confidence_thr,
-                nms_kernel=self.min_distance_object_centers,
-                confidence_thr=self.confidence_thr,
-                semantic_only=self.semantic_only,
-                fine_boundaries=self.fine_boundaries,
-                tile_size=self.tile_size,
-            )
-        self.last_config = self.model_config_name
-        return
+    # ---------------- (Threaded) Pipeline running entrypoint ----------------
+    @thread_worker
+    def run_in_thread(self, zarr_inpath=None, zarr_outpath=None):
+        return self.run(zarr_inpath, zarr_outpath)
 
     # ---------------- Helper methods ----------------    
-    def _get_image_as_array(self, img_layer):
-        '''If input image is a 2D array, return
-        '''
-    
-    # Batch mode will iterate across a 3D array (i.e. image_layer.data), so return array
-    # Non-batch mode will run on 2D array, so return array if 2D, and slice if 3D
-        if self.batch_mode:
-            return img_layer, None, None, None, None
+    def _get_image_layer_as_array(self, image_layer):
+        return image_layer.data
 
-        else:
-            # if self.confine_to_roi:
-                # Apply binary mask to the image
-                # Not currently implemented outside of viewer
-            
-            # else:
-            image = img_layer
-            y, x = 0, 0
-            slices = [slice(None)] * img_layer.ndim
-            axis = [0,1,2,3]
-
-            if img_layer.ndim == 4: # multiscale? use highest res level
-                image = img_layer[0]
-                # axis = viewer param, as is plane so i don't think these are relevant. we will just slice along z
-                axis = tuple(axis[:2])
-                plane = (0, 0)
-                slices[axis[0]], slices[axis[1]] = plane[0], plane[1]
-
-            elif img_layer.ndim == 3:
-                axis = axis[0]
-                # plane = 0
-                plane = 223 # TMP
-                slices[axis] = plane
-
-            else:
-                axis = None
-                plane = None
-
-            print(f'Image of size {img_layer.shape} sliced at plane {plane} from axis {axis}')
-
-            return image[tuple(slices)], axis, plane, y, x
-                
     def _check_option_compatibility(self):
-        if quantized_supported == False and self.using_quantized:
-            raise RuntimeWarning(
-                "No quantized backend is selected. " \
-                f"torch.backends.quantized.engine = {engine}" \
-                "Using Quantized Model may fail."
-            )
+        super()._check_option_compatibility()
 
         if self.output_to_layer:
             assert self.output_layer is not None, "Must select an output layer or uncheck Output to layer!"
@@ -318,53 +66,51 @@ class SliceInference:
                        self.image_layer.scale), "Viewport inference only supports images with scale 1 in all dimensions!"
             assert self.viewer.dims.order[0] != 1, "Viewport inference not supported for xz planes!"
 
-        # if not all(s == 1 for s in self.image_layer.scale):
-            # print(f'Image has non-unit scale. 2D segmentations will disappear after rotation or axis rolling!')
+        if not all(s == 1 for s in self.image_layer.scale):
+            print(f'Image has non-unit scale. 2D segmentations will disappear after rotation or axis rolling!')
+        
         return
 
-
-
-
-
-class SliceSegPipeline(SliceInference):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-
-    # ---------------- GUI Input Management ----------------
-
-    def _viewer_slices(self, image_layer, plane=None, axis=None):
-        corners = image_layer.corner_pixels.T.tolist()
-        if isinstance(axis, tuple) and isinstance(plane, tuple):
-            yslice = slice(*corners[2])
-            xslice = slice(*corners[3])
-        elif axis is not None:
-            # handle all of the weird special cases
-            cases12 = [(0, 1, 2), (0, 2, 1), (2, 1, 0), (1, 0, 2)]
-            cases01 = [(1, 2, 0)]
-            cases20 = [(2, 0, 1)]
-            if self.viewer.dims.order in cases12:
-                yslice = slice(*corners[1])
-                xslice = slice(*corners[2])
-            elif self.viewer.dims.order in cases01:
-                yslice = slice(*corners[0])
-                xslice = slice(*corners[1])
-            else:  # cases20
-                yslice = slice(*corners[2])
-                xslice = slice(*corners[0])
+    def _preprocess_image_array(self):
+        # Get the 2d slice from the image
+        if self.batch_mode:
+            return super()._preprocess_image_array()
+        
+        if self.confine_to_roi:
+            shapes_layer = [layer for layer in self.viewer.layers if isinstance(layer, Shapes)][0]
+            image, y, x, y_max, x_max, binary_mask = self._get_roi_slice(self.image, shapes_layer)
+            image[binary_mask == False] = 0
+            axis, plane = "overloaded", self.image_layer.data.shape
         else:
-            yslice = slice(*corners[0])
-            xslice = slice(*corners[1])
+            image, axis, plane, y, x = self._get_current_slice(self.image, self.image_layer)
 
-        print(f'Corners {corners}, slices {yslice, xslice}')
+        print(f'Image of size {image.shape} sliced at plane {plane} from axis {axis}')
+        return image, axis, plane, y, x        
 
-        return yslice, xslice
-
-    def _get_current_slice(self, image_layer):
+    def _get_roi_slice(self, image, shapes_layer):
+        shapes = np.array(shapes_layer.data)
+        min_y, min_x = np.inf, np.inf
+        max_y, max_x = -np.inf, -np.inf
+        for shape in shapes:
+            min_y, min_x = min(min_y, shape[:, 0].min()), min(min_x, shape[:, 1].min())
+            max_y, max_x = max(max_y, shape[:, 0].max()), max(max_x, shape[:, 1].max())
+        min_y, min_x, max_y, max_x = map(int, (min_y, min_x, max_y, max_x))
+        roi = image[min_y:max_y, min_x:max_x].copy()
+        mask = self._get_mask_from_roi(image, shapes_layer)
+        return roi, min_y, min_x, max_y, max_x, mask[min_y:max_y, min_x:max_x]
+    
+    def _get_mask_from_roi(self, image, shapes_layer):
+        h, w = image.shape[:2]
+        mask = np.zeros((h, w), dtype=bool)
+        for shape in shapes_layer.data:
+            rr, cc = polygon(shape[:, 0], shape[:, 1], (h, w))
+            mask[rr, cc] = True
+        return mask
+    
+    def _get_current_slice(self, image, image_layer):
         cursor_pos = self.viewer.cursor.position
 
         # handle multiscale by taking highest resolution level
-        image = image_layer.data
         if image_layer.multiscale:
             print('Using highest resolution level from multiscale!')
             image = image[0]
@@ -415,49 +161,41 @@ class SliceSegPipeline(SliceInference):
                 x = xslice.start
 
         return image[tuple(slices)], axis, plane, y, x
-
-    def _get_mask_from_roi(self, image_layer, shapes_layer):
-        h, w = image_layer.data.shape[:2]
-        mask = np.zeros((h, w), dtype=bool)
-        for shape in shapes_layer.data:
-            rr, cc = polygon(shape[:, 0], shape[:, 1], (h, w))
-            mask[rr, cc] = True
-        return mask
-
-    def _get_roi_slice(self, image_layer, shapes_layer):
-        shapes = np.array(shapes_layer.data)
-        min_y, min_x = np.inf, np.inf
-        max_y, max_x = -np.inf, -np.inf
-        for shape in shapes:
-            min_y, min_x = min(min_y, shape[:, 0].min()), min(min_x, shape[:, 1].min())
-            max_y, max_x = max(max_y, shape[:, 0].max()), max(max_x, shape[:, 1].max())
-        min_y, min_x, max_y, max_x = map(int, (min_y, min_x, max_y, max_x))
-        roi = image_layer.data[min_y:max_y, min_x:max_x].copy()
-        mask = self._get_mask_from_roi(image_layer, shapes_layer)
-        return roi, min_y, min_x, max_y, max_x, mask[min_y:max_y, min_x:max_x]
     
+    def _viewer_slices(self, image_layer, plane=None, axis=None):
+        corners = image_layer.corner_pixels.T.tolist()
+        if isinstance(axis, tuple) and isinstance(plane, tuple):
+            yslice = slice(*corners[2])
+            xslice = slice(*corners[3])
+        elif axis is not None:
+            # handle all of the weird special cases
+            cases12 = [(0, 1, 2), (0, 2, 1), (2, 1, 0), (1, 0, 2)]
+            cases01 = [(1, 2, 0)]
+            cases20 = [(2, 0, 1)]
+            if self.viewer.dims.order in cases12:
+                yslice = slice(*corners[1])
+                xslice = slice(*corners[2])
+            elif self.viewer.dims.order in cases01:
+                yslice = slice(*corners[0])
+                xslice = slice(*corners[1])
+            elif self.viewer.dims.order in cases20:
+                yslice = slice(*corners[2])
+                xslice = slice(*corners[0])
+        else:
+            yslice = slice(*corners[0])
+            xslice = slice(*corners[1])
 
+        print(f'Corners {corners}, slices {yslice, xslice}')
 
-
-# ---------------- Napari GUI wrapper ----------------
-def slice_inference_widget():
-    """
-    Factory function to create the widget for Napari.
-    This is what Napari will call.
-    """
-    from napari.layers import Image, Labels
-    from magicgui import widgets
-
-    logo = abspath(__file__, 'resources/empanada_logo.png')
-    model_configs = get_configs()
-
-    # ---------------- GUI result functions ----------------
-    def _show_batch_stack(self, *args):
+        return yslice, xslice
+    
+    # ---------------- GUI result output functions ----------------
+    def show_batch_stack(self, *args):
         stack = args[0]
         self.viewer.add_labels(stack, name=self.image_layer.name + '_batch_segs')
         self.pbar.hide()
 
-    def _show_test_result(self, *args):
+    def show_result(self, *args):
         seg, axis, plane, y, x = args[0]
 
         if axis == "overloaded":
@@ -492,7 +230,7 @@ def slice_inference_widget():
 
         self.pbar.hide()
 
-    def  _store_test_result(self, *args):
+    def store_result(self, *args):
         seg, axis, plane, y, x = args[0]
 
         if axis == "overloaded":
@@ -523,12 +261,22 @@ def slice_inference_widget():
         self.pbar.hide()
 
 
+# ---------------- Napari GUI wrapper ----------------
+def slice_inference_widget():
+    """
+    Factory function to create the widget for Napari.
+    This is what Napari will call.
+    """
+
+    logo = abspath(__file__, 'resources/empanada_logo.png')
+    model_configs = get_configs()
+
     # define magicgui params
     gui_params = dict(
         model_config=dict(widget_type='ComboBox', choices=list(model_configs.keys()),
                           value=list(model_configs.keys())[0], label='Model', tooltip='Model to use for inference'),
-        store_dir=dict(widget_type='FileEdit', value='no zarr storage', label='Directory', mode='d',
-                       tooltip='location to store segmentations on disk'),
+        # store_dir=dict(widget_type='FileEdit', value='no zarr storage', label='Directory', mode='d',
+                    #    tooltip='location to store segmentations on disk'),
         downsampling=dict(widget_type='ComboBox', choices=[1, 2, 4, 8, 16, 32, 64], value=1, label='Image Downsampling',
                           tooltip='Downsampling factor to apply before inference'),
         confidence_thr=dict(widget_type='FloatSpinBox', value=0.5, min=0.1, max=0.9, step=0.1,
@@ -553,15 +301,14 @@ def slice_inference_widget():
                       tooltip='If checked, inference will be restricted to the current viewport.'),
         output_to_layer=dict(widget_type='CheckBox', text='Output to layer', value=False,
                              tooltip='If checked, the segmentation is output to the selected output layer.'),
+        use_gpu=dict(widget_type='CheckBox', text='Use GPU', value=device_count() >= 1,
+                                 tooltip='If checked, run on GPU 0'),
+        use_quantized=dict(widget_type='CheckBox', text='Use quantized model', value=device_count() == 0 and quantized_supported,
+                                       tooltip='If checked, run on GPU 0'),
+        confine_to_roi=dict(widget_type='CheckBox', text='Confine to ROI', value=False,
+                                        tooltip='If checked, inference will be restricted to the ROI defined by a shapes layer.')
     )
 
-    gui_params['use_gpu'] = dict(widget_type='CheckBox', text='Use GPU', value=device_count() >= 1,
-                                 tooltip='If checked, run on GPU 0')
-    gui_params['use_quantized'] = dict(widget_type='CheckBox', text='Use quantized model', value=device_count() == 0 and quantized_supported,
-                                       tooltip='If checked, run on GPU 0')
-    # Add the new option to the gui_params dictionary
-    gui_params['confine_to_roi'] = dict(widget_type='CheckBox', text='Confine to ROI', value=False,
-                                        tooltip='If checked, inference will be restricted to the ROI defined by a shapes layer.')
     
     @magicgui(
         label_head=dict(widget_type='Label', label=f'<h1 style="text-align:center"><img src="{logo}"></h1>'),
@@ -596,8 +343,7 @@ def slice_inference_widget():
     ):
 
         # instantiate the class
-        inference_config = SliceSegPipeline(viewer=viewer,
-            label_head=label_head,
+        pipeline = SliceSegPipelineGUI(viewer=viewer,
             image_layer=image_layer,
             model_config=model_config,
             downsampling=downsampling,
@@ -616,11 +362,18 @@ def slice_inference_widget():
             confine_to_roi=confine_to_roi,
             output_to_layer=output_to_layer,
             output_layer=output_layer,
-            pbar=pbar
-            )
+            pbar=pbar)
         
         # method that configures & runs inference
-        inference_config.config_and_run_inference()
+        worker = pipeline.run_in_thread()
+
+        if batch_mode:
+            worker.returned.connect(pipeline.show_result if image_layer.data.ndim == 2 \
+                                    else pipeline.show_batch_stack)
+        else:
+            worker.returned.connect(pipeline.store_result if output_to_layer \
+                                    else pipeline.show_result)
+        worker.start()
         pbar.show()
 
     # make the scroll available
