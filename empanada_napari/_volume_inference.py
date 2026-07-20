@@ -28,19 +28,11 @@ class VolumeSegPipelineGUI(VolumeSegPipeline):
                  *args, **kwargs):
         image = self._get_image_layer_as_array(image_layer)
         self.image_layer = image_layer
+        self.image_name = image_layer.name
         self.viewer = viewer
         self.pbar = pbar
 
         super().__init__(image, *args, **kwargs)
-
-        if type(chunk_size) == int: chunk_size = [chunk_size]
-        if len(chunk_size) == 1:
-            self.chunk_size = tuple(int(chunk_size[0]) for _ in range(3))
-        else:
-            assert len(chunk_size) == 3, f"Chunk size must be 1 or 3 integers, got {chunk_size}"
-            self.chunk_size = tuple(int(s) for s in chunk_size)
-
-        self.pbar = pbar
 
     # ---------------- (Threaded) Pipeline running entrypoint ----------------
     @thread_worker

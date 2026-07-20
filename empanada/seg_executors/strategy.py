@@ -53,26 +53,24 @@ class InferenceStrategy(ABC):
         """
         return result
 
-    def _fill_holes(self, seg):
-        r"""Shared by the array-based strategies. Moved here (off the
+    def _fill_holes_in_segmentation(self, mask):        
+        """Shared by the array-based strategies. Moved here (off the
         old shared Executor base class) so tracker-based strategies
         never inherit a method that only works on dense 2D label arrays
         -- see bugfix/executor-known-bugs for the guard this replaces.
         """
-        from skimage import measure
-        from scipy.ndimage import binary_fill_holes
+        unique_indices = np.unique(mask)
+        rprops = measure.regionprops(mask)
 
-        assert seg.ndim == 2, f'_fill_holes only supports 2D dense label arrays, got {seg.ndim}D.'
-
-        unique_indices = np.unique(seg)
-        for rp in tqdm(measure.regionprops(seg), desc='filling holes in labels:'):
+        # crop labels and then apply fill holes
+        for rp in tqdm(rprops, desc='filling holes in labels:'):
             if rp.label in unique_indices and rp.label > 0:
                 minr, minc, maxr, maxc = rp.bbox
-                tmp = seg[minr:maxr, minc:maxc]
-                tmp = binary_fill_holes(tmp.astype(bool))
-                seg[minr:maxr, minc:maxc] = tmp.astype(seg.dtype) * rp.label
 
-        return seg
+                tmp = mask[minr:maxr, minc:maxc]
+                tmp = binary_fill_holes(tmp.astype(bool))
+                mask[minr:maxr, minc:maxc] = tmp.astype(mask.dtype) * rp.label
+        return mask
 
 
 class SingleSliceStrategy(InferenceStrategy):
@@ -84,6 +82,8 @@ class SingleSliceStrategy(InferenceStrategy):
     reconciler_cls = ArrayChunkReconciler
 
     def run(self, engine, image, axis=None, plane=None, y=None, x=None, **kwargs):
+        if isinstance(image, da.core.Array):
+            image = image.compute()
         seg = engine.infer(image)
         if self.fill_holes:
             seg = self._fill_holes(seg)

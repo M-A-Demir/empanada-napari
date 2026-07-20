@@ -17,9 +17,8 @@ if engine in (None or 'none'):
 
 class SliceSegPipeline:
     def __init__(self, 
-            image: np.ndarray | da.Array | zarr.array,
+            image: np.ndarray | da.Array | zarr.Array,
             model_config: str,
-            downsampling: int = 1,
             confidence_thr: float = 0.5,
             center_confidence_thr: float = 0.1,
             min_distance_object_centers: int = 3,
@@ -35,7 +34,6 @@ class SliceSegPipeline:
     ):
         self.image = image
         self.model_config_name = model_config
-        self.downsampling = downsampling
         self.confidence_thr = confidence_thr
         self.center_confidence_thr = center_confidence_thr
         self.min_distance_object_centers = min_distance_object_centers
@@ -52,36 +50,46 @@ class SliceSegPipeline:
         self.engine = None
 
         self._check_option_compatibility()
+        # image, axis, plane, y, x = self._preprocess_image_array()
+        # self.image = image
+        # self.axis_info = (axis, plane, y, x)
 
     # ---------------- Pipeline running entrypoint ----------------
-    def run(self, zarr_inpath=None, zarr_outpath=None):  
-        '''Step 1: Load the model config'''
+    def run(self, downsampling: int = 1, zarr_inpath=None, zarr_outpath=None):
+        '''Step 0: Get the 2D slice from the image array'''
+        image, axis, plane, y, x = self._preprocess_image_array()
+        return self._run_core(image, axis, plane, y, x, downsampling, zarr_inpath, zarr_outpath)
+
+
+    def _run_core(self, image, axis, plane, y, x, downsampling, zarr_inpath=None, zarr_outpath=None):
+        '''Step 1: Load the model config and set up the Engine'''
+        self._setup_engine(downsampling)
+
+        '''Step 2: Pick the InferenceStrategy (batch vs single-slice) and
+        the Executor (chunked vs single-region) for this run.'''
+        strategy = self._select_strategy()
+        executor = self._select_executor(strategy, image, zarr_inpath, zarr_outpath)
+
+        # Should downsampling be passed to executor, if it's also used in the engine?
+        '''Step 3: Return the computed segmentation array'''
+        seg, axis, plane, y, x = executor.run_workflow(self.engine, image, axis=axis,
+                                                       plane=plane, y=y, x=x)
+
+        return seg, axis, plane, y, x
+
+    def _setup_engine(self, downsampling):
+        '''Shared by _run_core and _preview_downscales_core: load the model
+        config (once per model_config_name) and get/update the Engine.'''
         model_configs = get_configs()
         self.model_config = read_yaml(model_configs[self.model_config_name])
 
         if self.last_config is None:
             self.last_config = self.model_config_name
 
-        '''Step 2: Setup the Engine'''
-        self.get_engine()
-                
-        '''Step 3: Get the 2D slice from the image array'''
-        image, axis, plane, y, x = self._preprocess_image_array()
-        print(image.shape, self.image.shape)
-
-        '''Step 4: Pick the InferenceStrategy (batch vs single-slice) and
-        the Executor (chunked vs single-region) for this run.'''
-        strategy = self._select_strategy()
-        executor = self._select_executor(strategy, image, zarr_inpath, zarr_outpath)
-
-        '''Step 5: Return the computed segmentation array'''
-        seg, axis, plane, y, x = executor.run_workflow(self.engine, image, axis=axis, 
-                                                       plane=plane, y=y, x=x)
-
-        return seg, axis, plane, y, x
+        self.get_engine(downsampling)
 
     # ---------------- Engine Management ----------------
-    def get_engine(self):
+    def get_engine(self, downsampling):
         reload_engine = (
             self.engine is None
             or self.last_config != self.model_config_name
@@ -90,7 +98,7 @@ class SliceSegPipeline:
         if reload_engine:
             self.engine = Engine2d(
                 self.model_config,
-                inference_scale=self.downsampling,
+                inference_scale=downsampling,
                 nms_kernel=self.min_distance_object_centers,
                 nms_threshold=self.center_confidence_thr,
                 confidence_thr=self.confidence_thr,
@@ -105,7 +113,7 @@ class SliceSegPipeline:
             # update the parameters of the engine
             # without reloading the model
             self.engine.update_params(
-                inference_scale=self.downsampling,
+                inference_scale=downsampling,
                 label_divisor=self.maximum_objects_per_class,
                 nms_threshold=self.center_confidence_thr,
                 nms_kernel=self.min_distance_object_centers,
@@ -124,7 +132,7 @@ class SliceSegPipeline:
         return SingleSliceStrategy(self.fill_holes)
 
     def _select_executor(self, strategy, image, zarr_inpath, zarr_outpath):
-        if (type(image) == da.Array | zarr.array) and zarr_inpath and zarr_outpath:
+        if isinstance(image, (da.Array, zarr.Array)) and zarr_inpath and zarr_outpath:
             scale = 2
             return ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=scale)
         return SingleRegionExecutor(strategy)
@@ -143,8 +151,8 @@ class SliceSegPipeline:
         '''
         image = self.image
 
-    # Batch mode will iterate across a 3D array, so return array
-    # Non-batch mode will run on 2D array, so return array if 2D, and slice if 3D
+        # Batch mode will iterate across a 3D array, so return array
+        # Non-batch mode will run on 2D array, so return array if 2D, and slice if 3D
         if self.batch_mode:
             return image, None, None, None, None
 
@@ -178,3 +186,44 @@ class SliceSegPipeline:
             print(f'Image of size {image.shape} sliced at plane {plane} from axis {axis}')
 
             return image[tuple(slices)], axis, plane, y, x
+
+    def preview_downscales(self, slices: tuple | list, downsampling: int = 1):
+        image, axis, plane, y, x = self._preprocess_image_array()
+        return self._preview_downscales_core(image, axis, plane, y, x, slices, downsampling)
+
+    def _preview_downscales_core(self, image, axis, plane, y, x, slices, downsampling=1):
+        self._setup_engine(downsampling)
+
+        # `y`/`x` describe where `image` (already preprocessed) sits
+        # relative to the original array; `slices` crops a further
+        # sub-region out of it for the preview, so its own start offset
+        # has to be folded in here too, or the returned result places
+        # every preview layer at (y, x) instead of where the square
+        # actually was -- looks like the layer has no labels, when really
+        # it's just sitting in the wrong spot.
+        y = (y or 0) + slices[0].start
+        x = (x or 0) + slices[1].start
+
+        # Takes small square from preprocessed image array - i.e. 512x512
+        size = 512
+        image = image[slices]
+
+        if any(d > size for d in image.shape):
+            image = self._centre_crop(image, size)
+
+        if isinstance(image, (da.Array, zarr.Array)):
+            image = image.compute()
+
+        strategy = self._select_strategy()
+        return ChunkedExecutor(strategy, image)._preview_downscales(self.engine, image,
+                                                                    axis=axis, plane=plane, y=y, x=x)
+    
+
+    def _centre_crop(self, arr, size):
+        """Extract a centred square or cube from an array."""
+        size = (size,) * arr.ndim
+        centre = np.array(arr.shape) // 2
+
+        slices = tuple(slice(c-(s//2), (c-(s//2))+s)
+                       for c, s in zip(centre, size))
+        return arr[slices]

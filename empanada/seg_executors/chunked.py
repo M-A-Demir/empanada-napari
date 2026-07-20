@@ -5,6 +5,7 @@ from .executor import Executor
 from .reconciler import ArrayChunkReconciler
 from empanada.zarr_utils import _write_empty_chunk, _generate_tiles
 
+PREVIEW_SCALES = {'full_res': 1, 'downscaled_2': 2, 'downscaled_4': 4, 'downscaled_8': 8, 'downscaled_16': 16, 'downscaled_32': 32}
 
 class ChunkedExecutor(Executor):
     r"""Runs the strategy on N chunks (an initial panel split, then
@@ -53,6 +54,18 @@ class ChunkedExecutor(Executor):
         # reading logic belongs to the caller, not to chunk reconciliation
         # -- see SliceSegPipeline/VolumeSegPipeline.write_out_multiscale.
         self.multiscale_writer = multiscale_writer
+
+    # ---------------- Downscale preview --------------------
+    def _preview_downscales(self, engine, image_sample, **kwargs):
+        from empanada.seg_executors.single_region import SingleRegionExecutor
+
+        previews = {name: SingleRegionExecutor(self.strategy).run_workflow(engine, 
+                                                                           self._downsample_array(image_sample, factor),
+                                                                           **kwargs)
+                    for name, factor in PREVIEW_SCALES.items()}
+        return previews
+
+
 
     # ---------------- chunk identity / id space --------------------
     # Unchanged from example_workflow.py / the pre-refactor parallel.py:

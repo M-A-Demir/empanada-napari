@@ -37,9 +37,21 @@ class SliceSegPipelineGUI(SliceSegPipeline):
         super().__init__(image, *args, **kwargs)
 
     # ---------------- (Threaded) Pipeline running entrypoint ----------------
-    @thread_worker
-    def run_in_thread(self, zarr_inpath=None, zarr_outpath=None):
-        return self.run(zarr_inpath, zarr_outpath)
+    def run_in_thread(self, downsampling: int = 1, zarr_inpath=None, zarr_outpath=None):
+        image, axis, plane, y, x = self._preprocess_image_array()  # runs on whatever thread calls run_in_thread() -- the main thread, since widget() calls it directly
+
+        @thread_worker
+        def _worker():
+            return self._run_core(image, axis, plane, y, x, downsampling, zarr_inpath, zarr_outpath)
+        return _worker()
+
+    def preview_downscales_in_thread(self, slices, downsampling: int = 1):
+        image, axis, plane, y, x = self._preprocess_image_array()  # main thread
+
+        @thread_worker
+        def _worker():
+            return self._preview_downscales_core(image, axis, plane, y, x, slices, downsampling)
+        return _worker()
 
     # ---------------- Helper methods ----------------    
     def _get_image_layer_as_array(self, image_layer):
@@ -189,14 +201,35 @@ class SliceSegPipelineGUI(SliceSegPipeline):
 
         return yslice, xslice
     
+
+    def _get_region_from_shapes(self):
+        shapes_layers = [layer for layer in self.viewer.layers if isinstance(layer, Shapes)]
+        assert len(shapes_layers) > 0, "Please create a shapes layer with a square \
+                                        around the region you'd like to preview." 
+
+        if self.confine_to_roi and len(shapes_layers)>1:
+            shapes_layer = shapes_layers[1]
+        else:
+            shapes_layer = shapes_layers[0]
+            
+        shape = np.array(shapes_layer.data[0])   # first drawn rectangle
+        # Last two columns are always y/x regardless of the layer's total
+        # dimensionality -- for an N-D image, a rectangle drawn on the
+        # current 2D canvas has N-2 leading columns constant (the slider
+        # position on the other dims), which the first-two-columns version
+        # of this picked up instead, producing a zero-area slice.
+        min_y, min_x = shape[:, -2].min(), shape[:, -1].min()
+        max_y, max_x = shape[:, -2].max(), shape[:, -1].max()
+        return (slice(int(min_y), int(max_y)), slice(int(min_x), int(max_x)))
+
     # ---------------- GUI result output functions ----------------
     def show_batch_stack(self, *args):
         stack = args[0]
         self.viewer.add_labels(stack, name=self.image_layer.name + '_batch_segs')
         self.pbar.hide()
 
-    def show_result(self, *args):
-        seg, axis, plane, y, x = args[0]
+    def show_result(self, result, name='empanada_seg_2d', scale_factor=1):
+        seg, axis, plane, y, x = result
 
         if axis == "overloaded":
             out_2d = np.zeros(plane, dtype=seg.dtype)
@@ -225,8 +258,8 @@ class SliceSegPipelineGUI(SliceSegPipeline):
         else:
             translate = [y, x]
 
-        self.viewer.add_labels(seg, name=f'empanada_seg_2d', visible=True, translate=tuple(translate))
-        self.viewer.layers[-1].scale = self.image_layer.scale
+        self.viewer.add_labels(seg, name=name, visible=True, translate=tuple(translate))
+        self.viewer.layers[-1].scale = tuple(s * scale_factor for s in self.image_layer.scale)
 
         self.pbar.hide()
 
@@ -306,13 +339,17 @@ def slice_inference_widget():
         use_quantized=dict(widget_type='CheckBox', text='Use quantized model', value=device_count() == 0 and quantized_supported,
                                        tooltip='If checked, run on GPU 0'),
         confine_to_roi=dict(widget_type='CheckBox', text='Confine to ROI', value=False,
-                                        tooltip='If checked, inference will be restricted to the ROI defined by a shapes layer.')
-    )
+                                        tooltip='If checked, inference will be restricted to the ROI defined by a shapes layer.'),
+    
+        preview_region=dict(widget_type='CheckBox', text='Preview segmentation scales', value=False,
+                                        tooltip='If checked, an initial preview of all downsamplings will be created, defined by a shapes layer.')
+        )
 
     
     @magicgui(
         label_head=dict(widget_type='Label', label=f'<h1 style="text-align:center"><img src="{logo}"></h1>'),
         call_button='Run 2D Inference',
+        continue_button=dict(widget_type='Button', label='Continue', visible=False),
         layout='vertical',
         scrollable=True,
         pbar={'visible': False, 'max': 0, 'label': 'Running...'},
@@ -337,16 +374,38 @@ def slice_inference_widget():
             use_quantized,
             viewport,
             confine_to_roi,
+            preview_region,
             output_to_layer,
             output_layer: Labels,
-            pbar: widgets.ProgressBar
+            pbar: widgets.ProgressBar,
+            continue_button: widgets.PushButton
     ):
+        
+        def on_preview_done(previews):
+            from empanada.seg_executors.chunked import PREVIEW_SCALES
+            for name, seg_result in previews.items():
+                pipeline.show_result(seg_result, name=f'preview_{name}', scale_factor=PREVIEW_SCALES[name])
+            widget.call_button.visible = False
+            widget.continue_button.visible = True
+
+        def on_continue(*_):
+            widget.continue_button.visible = False
+
+            downsampling_level = widget.downsampling.value # GUI slider thing
+            worker = pipeline.run_in_thread(downsampling=downsampling_level)
+            if batch_mode:
+                worker.returned.connect(pipeline.show_result if image_layer.data.ndim == 2 \
+                                    else pipeline.show_batch_stack)
+            else:
+                worker.returned.connect(pipeline.store_result if output_to_layer \
+                                    else pipeline.show_result)
+            worker.start()
 
         # instantiate the class
         pipeline = SliceSegPipelineGUI(viewer=viewer,
             image_layer=image_layer,
             model_config=model_config,
-            downsampling=downsampling,
+            # downsampling=downsampling,
             confidence_thr=confidence_thr,
             center_confidence_thr=center_confidence_thr,
             min_distance_object_centers=min_distance_object_centers,
@@ -364,16 +423,19 @@ def slice_inference_widget():
             output_layer=output_layer,
             pbar=pbar)
         
-        # method that configures & runs inference
-        worker = pipeline.run_in_thread()
+        
+        # Only run if we're using OME-Zarr:
+        if preview_region:
+            preview_worker = pipeline.preview_downscales_in_thread(pipeline._get_region_from_shapes())
+            preview_worker.returned.connect(on_preview_done)
+            preview_worker.start()
+            widget.continue_button.clicked.connect(on_continue)
 
-        if batch_mode:
-            worker.returned.connect(pipeline.show_result if image_layer.data.ndim == 2 \
-                                    else pipeline.show_batch_stack)
         else:
-            worker.returned.connect(pipeline.store_result if output_to_layer \
-                                    else pipeline.show_result)
-        worker.start()
+            on_continue()
+
+        widget.call_button.visible = True
+
         pbar.show()
 
     # make the scroll available

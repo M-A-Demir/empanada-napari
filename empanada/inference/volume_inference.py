@@ -18,7 +18,7 @@ if torch.backends.quantized.engine in (None or 'none'):
 
 class VolumeSegPipeline:
     def __init__(self,
-            image: np.ndarray | da.Array | zarr.array,
+            image: np.ndarray | da.Array | zarr.Array,
             model_config: str,
             multiscale_level: int=0,
             use_gpu: bool = False,
@@ -84,13 +84,22 @@ class VolumeSegPipeline:
         self.last_config = None
         self.engine = None
 
+        if isinstance(chunk_size, str):
+            chunk_size = [int(s) for s in chunk_size.split(',')]
+
         if type(chunk_size) == int:
             self.chunk_size = tuple(chunk_size for _ in range(3))
+        elif len(chunk_size) == 1:
+            self.chunk_size = tuple(int(chunk_size[0]) for _ in range(3))
         else:
             assert len(chunk_size) == 3, f"Chunk size must be 1 or 3 integers, got {chunk_size}"
             self.chunk_size = tuple(int(s) for s in chunk_size)
 
+        self.image_name = 'labels'
+
         self._check_option_compatibility()
+
+        self.image = self._preprocess_image_array()
 
     # ---------------- Pipeline running entrypoint ----------------
     def run(self, zarr_inpath=None, zarr_outpath=None):  
@@ -107,13 +116,14 @@ class VolumeSegPipeline:
             print(f'Running without zarr storage directory, this may use a lot of memory!')
         else:
             # Consider using this url for both: regular Zarr output & OME-Zarr output
-            self.store_url = os.path.join(self.store_dir, f'{self.image_layer.name}_{self.model_config_name}.zarr')
+            self.store_url = os.path.join(self.store_dir, f'{self.image_name}_{self.model_config_name}.zarr')
 
         '''Step 3: Setup the Engine'''
         self.get_engine()
 
         '''Step 4: Get the 3d slice from the image array'''
-        image = self._preprocess_image_array()
+        # image = self._preprocess_image_array()
+        image = self.image
         print(image.shape, self.image.shape)
 
         '''Step 5: Pick the InferenceStrategy (batch vs single-slice) and
@@ -207,7 +217,7 @@ class VolumeSegPipeline:
         return StackStrategy()
 
     def _select_executor(self, strategy, image, zarr_inpath, zarr_outpath):
-        if (type(image) == da.Array | zarr.array) and zarr_inpath and zarr_outpath:
+        if isinstance(image, (da.Array, zarr.Array)) and zarr_inpath and zarr_outpath:
             scale = 2
             return ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=scale)
         return SingleRegionExecutor(strategy)
