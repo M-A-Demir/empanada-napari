@@ -62,8 +62,7 @@ class VolumeSegPipelineGUI(VolumeSegPipeline):
       
         return super()._preprocess_image_array()
 
-
-# ---------------- Napari Helper methods ----------------
+    # ---------------- GUI result output functions ----------------
     def _new_layers(self, mask, description, instances=None):
         metadata = {}
         if instances is not None:
