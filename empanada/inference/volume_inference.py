@@ -217,7 +217,12 @@ class VolumeSegPipeline:
         return StackStrategy()
 
     def _select_executor(self, strategy, image, zarr_inpath, zarr_outpath):
-        if isinstance(image, (da.Array, zarr.Array)) and zarr_inpath and zarr_outpath:
+        # zarr_inpath/zarr_outpath are optional, not gating conditions:
+        # ChunkedExecutor's _write_empty_chunk passes zarr_outpath straight
+        # to zarr.open_group, which falls back to an in-memory store when
+        # it's None -- so a lazy (dask/zarr) image gets chunked whether or
+        # not the caller supplied explicit store paths.
+        if isinstance(image, (da.Array, zarr.Array)):
             scale = 2
             return ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=scale)
         return SingleRegionExecutor(strategy)

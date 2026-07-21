@@ -184,10 +184,14 @@ class ChunkedExecutor(Executor):
                 self.zarr_outpath, image, inp_scale=[0.005, 0.005]
             )
 
+        print(f"Running panels...")
+
         self._create_class_ids(panel_indices)
         finalized = {'panel': self._run_wave(
             engine, image, panel_indices, 'panel', {}, context, **kwargs
         )}
+
+        print(f"Running strips...")
 
         strips_by_direction = self._get_strips(image.shape)
         for chunk_type in ('x_strip', 'y_strip', 'z_strip'):
@@ -205,6 +209,8 @@ class ChunkedExecutor(Executor):
                 engine, image, strip_indices, chunk_type, neighbours_by_idx,
                 context, **kwargs
             )
+            
+        print(f"Remapping labels...")
 
         self.reconciler.apply_final_remap(finalized, context)
         result = self.reconciler.assemble_result(finalized, context)

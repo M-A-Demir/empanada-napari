@@ -46,6 +46,7 @@ class SliceSegPipelineGUI(SliceSegPipeline):
         return _worker()
 
     def preview_downscales_in_thread(self, slices, downsampling: int = 1):
+        pbar.show()
         image, axis, plane, y, x = self._preprocess_image_array()  # main thread
 
         @thread_worker
@@ -96,7 +97,7 @@ class SliceSegPipelineGUI(SliceSegPipeline):
         else:
             image, axis, plane, y, x = self._get_current_slice(self.image, self.image_layer)
 
-        print(f'Image of size {image.shape} sliced at plane {plane} from axis {axis}')
+        print(f'Image of size {image.shape} sliced at plane {plane} from axis {axis}. Type: {type(image)}')
         return image, axis, plane, y, x        
 
     def _get_roi_slice(self, image, shapes_layer):
@@ -231,35 +232,53 @@ class SliceSegPipelineGUI(SliceSegPipeline):
     def show_result(self, result, name='empanada_seg_2d', scale_factor=1):
         seg, axis, plane, y, x = result
 
+        # napari's transform pipeline applies translate AFTER scale
+        # (world = translate + scale * data), so a pixel offset measured
+        # in image_layer's *data* coordinates (y, x, plane -- all of
+        # which come from slicing self.image, not the viewer) has to be
+        # multiplied through image_layer.scale, and shifted by
+        # image_layer.translate, before it's a valid world-space
+        # translate. Using the raw pixel offset only looked right when
+        # image_layer had scale=1/translate=0 -- for a calibrated image
+        # (non-unit scale) every added layer landed at roughly
+        # data_offset/scale instead of the drawn region.
+        img_scale = self.image_layer.scale
+        img_translate = self.image_layer.translate
+
         if axis == "overloaded":
             out_2d = np.zeros(plane, dtype=seg.dtype)
             seg_shape = seg.shape
             out_2d[y:y + seg_shape[0], x:x + seg_shape[1]] = seg
             seg = out_2d
-            translate = [0, 0]
+            translate = img_translate.tolist()
         elif axis is not None and plane is not None:
             if isinstance(axis, tuple) and isinstance(plane, tuple):
                 seg = np.expand_dims(seg, axis=axis)
-                translate = [0, 0, y, x]
-                translate[axis[0]] = plane[0]
-                translate[axis[1]] = plane[1]
+                translate = list(img_translate)
+                translate[2] += img_scale[2] * (y or 0)
+                translate[3] += img_scale[3] * (x or 0)
+                translate[axis[0]] = img_translate[axis[0]] + img_scale[axis[0]] * plane[0]
+                translate[axis[1]] = img_translate[axis[1]] + img_scale[axis[1]] * plane[1]
             else:
                 seg = np.expand_dims(seg, axis=axis)
 
                 # oddly translate has to be a list and
                 # not an array or things break. WHY????
                 translate = self.image_layer.translate.tolist()
-                translate[axis] += plane
+                translate[axis] += img_scale[axis] * plane
                 yaxis, xaxis = [i for i in range(3) if i != axis]
                 if y is not None:
-                    translate[yaxis] += y
+                    translate[yaxis] += img_scale[yaxis] * y
                 if x is not None:
-                    translate[xaxis] += x
+                    translate[xaxis] += img_scale[xaxis] * x
         else:
-            translate = [y, x]
+            translate = [
+                img_translate[-2] + img_scale[-2] * y,
+                img_translate[-1] + img_scale[-1] * x,
+            ]
 
         self.viewer.add_labels(seg, name=name, visible=True, translate=tuple(translate))
-        self.viewer.layers[-1].scale = tuple(s * scale_factor for s in self.image_layer.scale)
+        self.viewer.layers[-1].scale = tuple(s * scale_factor for s in img_scale)
 
         self.pbar.hide()
 
@@ -385,11 +404,12 @@ def slice_inference_widget():
             from empanada.seg_executors.chunked import PREVIEW_SCALES
             for name, seg_result in previews.items():
                 pipeline.show_result(seg_result, name=f'preview_{name}', scale_factor=PREVIEW_SCALES[name])
-            widget.call_button.visible = False
+            # widget.call_button.visible = False
             widget.continue_button.visible = True
 
         def on_continue(*_):
             widget.continue_button.visible = False
+            pbar.show()
 
             downsampling_level = widget.downsampling.value # GUI slider thing
             worker = pipeline.run_in_thread(downsampling=downsampling_level)
@@ -423,7 +443,6 @@ def slice_inference_widget():
             output_layer=output_layer,
             pbar=pbar)
         
-        
         # Only run if we're using OME-Zarr:
         if preview_region:
             preview_worker = pipeline.preview_downscales_in_thread(pipeline._get_region_from_shapes())
@@ -436,7 +455,7 @@ def slice_inference_widget():
 
         widget.call_button.visible = True
 
-        pbar.show()
+        
 
     # make the scroll available
     scroll = QScrollArea()

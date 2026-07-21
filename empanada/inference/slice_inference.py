@@ -63,17 +63,20 @@ class SliceSegPipeline:
 
     def _run_core(self, image, axis, plane, y, x, downsampling, zarr_inpath=None, zarr_outpath=None):
         '''Step 1: Load the model config and set up the Engine'''
+        print(f"Using downsampling level: {downsampling}")
         self._setup_engine(downsampling)
 
         '''Step 2: Pick the InferenceStrategy (batch vs single-slice) and
         the Executor (chunked vs single-region) for this run.'''
         strategy = self._select_strategy()
-        executor = self._select_executor(strategy, image, zarr_inpath, zarr_outpath)
+        executor = self._select_executor(strategy, image, zarr_inpath, zarr_outpath, downsampling)
 
         # Should downsampling be passed to executor, if it's also used in the engine?
         '''Step 3: Return the computed segmentation array'''
         seg, axis, plane, y, x = executor.run_workflow(self.engine, image, axis=axis,
                                                        plane=plane, y=y, x=x)
+
+        print("Segmentation Complete.")
 
         return seg, axis, plane, y, x
 
@@ -131,10 +134,14 @@ class SliceSegPipeline:
             return BatchSliceStrategy(self.fill_holes)
         return SingleSliceStrategy(self.fill_holes)
 
-    def _select_executor(self, strategy, image, zarr_inpath, zarr_outpath):
-        if isinstance(image, (da.Array, zarr.Array)) and zarr_inpath and zarr_outpath:
-            scale = 2
-            return ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=scale)
+    def _select_executor(self, strategy, image, zarr_inpath, zarr_outpath, downsampling):
+        # zarr_inpath/zarr_outpath are optional, not gating conditions:
+        # ChunkedExecutor's _write_empty_chunk passes zarr_outpath straight
+        # to zarr.open_group, which falls back to an in-memory store when
+        # it's None -- so a lazy (dask/zarr) image gets chunked whether or
+        # not the caller supplied explicit store paths.
+        if isinstance(image, (da.Array, zarr.Array)):
+            return ChunkedExecutor(strategy, zarr_inpath, zarr_outpath, scale=downsampling)
         return SingleRegionExecutor(strategy)
 
     def _check_option_compatibility(self):
@@ -183,7 +190,7 @@ class SliceSegPipeline:
                 axis = None
                 plane = None
 
-            print(f'Image of size {image.shape} sliced at plane {plane} from axis {axis}')
+            print(f'Image of size {image.shape} sliced at plane {plane} from axis {axis}. Type: {type(image)}')
 
             return image[tuple(slices)], axis, plane, y, x
 
@@ -208,8 +215,21 @@ class SliceSegPipeline:
         size = 512
         image = image[slices]
 
-        if any(d > size for d in image.shape):
-            image = self._centre_crop(image, size)
+        print(f"Creating previews of segmentations on roi of size {image.shape} at position x={x} y={y}")
+
+        # Centres a `size` window on `image` per axis, clamped so it
+        # never overhangs an edge (and left as the whole axis if the
+        # roi itself is already narrower than `size` there) -- a no-op
+        # when every axis already fits, so it's safe to call
+        # unconditionally.
+        image, (crop_y, crop_x) = self._centre_crop(image, size)
+        # _centre_crop's window starts inside `image`, not at its
+        # (0, 0) -- fold that offset into y/x too, or the result
+        # keeps pointing at the drawn square's corner while the
+        # pixels actually came from a smaller, centred sub-window
+        # of it.
+        y += crop_y
+        x += crop_x
 
         if isinstance(image, (da.Array, zarr.Array)):
             image = image.compute()
@@ -217,13 +237,20 @@ class SliceSegPipeline:
         strategy = self._select_strategy()
         return ChunkedExecutor(strategy, image)._preview_downscales(self.engine, image,
                                                                     axis=axis, plane=plane, y=y, x=x)
-    
+
 
     def _centre_crop(self, arr, size):
-        """Extract a centred square or cube from an array."""
-        size = (size,) * arr.ndim
-        centre = np.array(arr.shape) // 2
+        """Extract up to a `size` square/cube centred on `arr`, per
+        axis, clamped so the window never extends past that axis's own
+        bounds -- if centring would overhang an edge, the window is
+        shifted back to stop flush with it instead, and an axis
+        already narrower than `size` is kept as-is. Also returns the
+        (per-axis) offset of the crop's origin within `arr`."""
+        offsets, lengths = [], []
+        for dim_size in arr.shape:
+            length = min(size, dim_size)
+            offsets.append((dim_size - length) // 2)
+            lengths.append(length)
 
-        slices = tuple(slice(c-(s//2), (c-(s//2))+s)
-                       for c, s in zip(centre, size))
-        return arr[slices]
+        slices = tuple(slice(o, o + l) for o, l in zip(offsets, lengths))
+        return arr[slices], tuple(offsets)
