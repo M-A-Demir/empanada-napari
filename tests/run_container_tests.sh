@@ -1,12 +1,8 @@
 #!/bin/bash
 
-# Run Installation Tests:
-echo "Running Installation Tests..."
-python -m pytest -s -vv test_installation.py
-
-echo "Tests Complete."
-
-# Print empanada version + changelog link
+# Whether to exit 1 on fail (CI only) - otherwise, information printed only
+EXIT_ON_FAIL=${EXIT_ON_FAIL:-false}
+status=0
 # Whether to run a longer tests, if /tests/test_install_extended.py is provided
 EXTENDED_TESTS=${EXTENDED_TESTS:-false}
 # Whether to skip start-up tests entirely
@@ -24,13 +20,17 @@ echo -e "$NAME Container Tests\n"
 
 if ! python -m pytest /tests/test_install.py -v --tb=line; then
 	echo -e "WARNING: Some tests failed. Container may not run correctly."
+	status=1
 fi
 
-if [[ "$EXTENDED_TESTS" = "true" && /tests/test_install_extended.py ]]; then
+if [[ "$EXTENDED_TESTS" = "true" && -f /tests/test_install_extended.py ]]; then
 	if ! python -m pytest /tests/test_install_extended.py -v --tb=line; then
 		echo -e "WARNING: Some extended tests failed."
+		status=1
 	fi
 fi
+
+# 
 
 echo -e "\nTests complete"
 
@@ -43,3 +43,9 @@ echo "Documentation: https://empanada.readthedocs.io/en/latest/ | Changelog: htt
 # Print versions of models with this version of Empanada:
 python -c "from empanada_napari.utils import get_configs; model_configs=get_configs(); model_names=list(model_configs.keys()); print('Available Models:', *model_names)"
 echo ""
+
+# If not in CI, don't give an exit code which would stop CMD if non zero 
+if [ "$EXIT_ON_FAIL" = "true" ]; then
+	exit "$status"
+fi
+
