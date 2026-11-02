@@ -1,0 +1,101 @@
+name: Build and test container, publishing to GHCR if main
+
+on:
+  workflow_dispatch:
+
+# Build and test Ubuntu 24 container with Python 3.12
+# On main: tag, push to GHCR and sign
+jobs:
+  build-container:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      REGISTRY: ghcr.io
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build package for the container
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir container-dist
+
+      - name: Evaluate build name, tags and version
+        id: meta
+        run: |
+          # GHCR requires a lower-case image name
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          # wheel filename: {name}-{version}-{python}-{abi}-{platform}.whl
+          version="$(basename container-dist/*.whl | cut -d- -f2 | tr '+' '-')"
+          {
+            echo "image=${image}"
+            echo "sha_tag=${image}:sha-${GITHUB_SHA::7}"
+            echo "version=${version}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build container
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          provenance: false
+          sbom: false
+          tags: empanada-napari:ci
+          build-args: |
+            LOCAL_BUILD=true
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
+
+      - name: Container start-up tests (no GUI)
+        run: |
+          mkdir -p test-data
+          docker run --rm -e DISPLAY=:99 -v "${GITHUB_WORKSPACE}/test-data:/test-data" \
+            -e EXIT_ON_FAIL=true empanada-napari:ci /tests/run_container_tests.sh
+
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Main only
+      - name: Push container
+        id: push
+        if: github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+          build-args: |
+            LOCAL_BUILD=true
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
+
+      - name: Install cosign
+        if: github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Sign image
+        if: github.ref == 'refs/heads/main'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
