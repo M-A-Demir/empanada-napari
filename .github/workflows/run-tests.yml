@@ -1,14 +1,9 @@
-name: Run pytests and build+publish docker container if tests pass
+name: Run Pytests (no container install)
 
 on:
   push:
     branches:
       - '**'  # Run on all branches
-
-env:
-  # GitHub container registry (could use dockerhub)
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   test:
